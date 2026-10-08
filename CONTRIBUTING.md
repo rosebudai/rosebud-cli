@@ -30,4 +30,4 @@ ROSEBUD_API_BASE=http://localhost:8000 \
 
 1. In a pull request, update `version` in `package.json` and `package-lock.json` and add a `CHANGELOG.md` entry. CI must pass on Linux and Windows.
 2. After merging, tag the merge commit and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
-3. The **Publish to npm** workflow checks that the tag matches `package.json`, runs the checks and tests, and publishes with provenance. Versions with a hyphen (for example `0.2.0-rc.1`) go to the `next` dist-tag instead of `latest`.
+3. The **Publish to npm** workflow checks that the tag matches `package.json`, runs the checks and tests, and publishes with provenance. It authenticates through npm trusted publishing, so the repository stores no npm token. Versions with a hyphen (for example `0.2.0-rc.1`) go to the `next` dist-tag instead of `latest`.
