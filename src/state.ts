@@ -153,7 +153,7 @@ export function outsideBuild(
   )
     throw inputError(
       "state_in_build",
-      "Keep --state and the credential directory outside the uploaded build folder.",
+      "The upload folder can't contain the CLI's saved state (--state, default .rosebud/project.json) or credentials. Publish the game's build folder, not the project root. No build step? Copy the game's files into a folder such as ./dist and publish that.",
     );
 }
 export async function withStateLock<T>(

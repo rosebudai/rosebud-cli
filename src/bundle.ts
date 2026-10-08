@@ -143,6 +143,12 @@ async function packDirectory(directory: string): Promise<Uint8Array> {
           "entry_limit",
           `Include at most ${MAX_ENTRIES} entries, including directories.`,
         );
+      // Usually a project root was published instead of its build folder.
+      if (name.startsWith("."))
+        throw inputError(
+          "unsafe_path",
+          `Hidden files and folders can't be uploaded: ${path}. Publish a folder that holds only the game's files, such as a copy in ./dist.`,
+        );
       if (
         !/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name) ||
         name.length > 255 ||
@@ -150,7 +156,7 @@ async function packDirectory(directory: string): Promise<Uint8Array> {
       ) {
         throw inputError(
           "unsafe_path",
-          `Use letters, numbers, dots, hyphens or underscores in relative paths; remove hidden files: ${path}`,
+          `Use letters, numbers, dots, hyphens or underscores in relative paths: ${path}`,
         );
       }
       if (
