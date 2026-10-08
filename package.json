@@ -1,0 +1,54 @@
+{
+  "name": "@rosebudai/cli",
+  "version": "0.1.0",
+  "description": "Publish and update browser-ready games from your terminal or coding agent.",
+  "keywords": [
+    "rosebud",
+    "game-hosting",
+    "browser-games",
+    "cli",
+    "coding-agents"
+  ],
+  "homepage": "https://rosebud.ai/developers/agent-publishing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rosebudai/rosebud-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rosebudai/rosebud-cli/issues"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {},
+  "bin": {
+    "rosebud": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "CHANGELOG.md",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && prettier --check .",
+    "format": "prettier --write .",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "fflate": "0.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

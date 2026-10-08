@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+.env*
+private-*.json
+
+private-publish-*/
+.rosebud/

@@ -1,0 +1,14 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: #101419; color: #f4f1df; font-family: ui-monospace, monospace; text-align: center; }
+main { max-width: 40rem; margin: auto; padding: 2rem 1rem; }
+h1 { font-family: system-ui, sans-serif; font-size: clamp(2rem, 8vw, 3.5rem); letter-spacing: -.04em; margin: 1rem 0; }
+p { line-height: 1.7; }
+.eyebrow, .caption { font-size: .75rem; color: #b9c5bd; }
+#score { color: #eef59e; min-height: 3.5rem; }
+#garden { display: grid; grid-template-columns: repeat(3, 1fr); gap: .65rem; max-width: 23rem; margin: 1rem auto 1.75rem; }
+.seed { aspect-ratio: 1; border: 1px solid #4b5d53; border-radius: .75rem; background: #1b2822; font-size: 2rem; color: #a6beaf; }
+.seed[data-active="true"] { background: #cedb90; color: #182415; cursor: pointer; }
+.seed[data-active="true"]:hover { background: #e7edb5; }
+button:focus-visible { outline: 3px solid #e4bdf8; outline-offset: 4px; }
+#restart { font: inherit; padding: .85rem 1.25rem; min-height: 44px; border: 1px solid #8aab96; border-radius: .4rem; background: #243c2d; color: #f4f1df; cursor: pointer; }
+#restart:hover { background: #36583f; }
