@@ -29,6 +29,8 @@ rosebud publish --directory ./dist \
 rosebud connect
 ```
 
+No build step? Copy the files your game needs (`index.html` and everything it loads) into a folder such as `./dist` and publish that, not the project root: the CLI keeps its state in `.rosebud/` there, and hidden files can't be uploaded.
+
 For the supplied sample, use `--directory ./examples/signal-garden`. For an existing archive, use `--zip ./game.zip`. Add `--thumbnail ./cover.png` to supply a gameplay screenshot; omitting it keeps the existing placeholder.
 
 `publish` creates a game and saves `.rosebud/project.json` outside the build directory. Its JSON result includes a public `play_url` and private `claim_url`. `connect` returns a private `approval_url`: give it to the intended owner, who signs in and explicitly approves permission to update this one game. An unclaimed game can be claimed and connected in the same action. Visiting the link or signing in alone does not approve access.

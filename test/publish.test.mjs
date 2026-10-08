@@ -569,3 +569,24 @@ test("private files are only judged by permission bits where the platform has th
   // Windows always reports 0o666; rejecting it broke every command after publish.
   assert.equal(exposedToOtherUsers(0o100666, "win32"), false);
 });
+
+test("publishing a project root says how to publish a game without a build step", async (t) => {
+  const remote = await api(t, (_req, res) => json(res, success));
+  const client = new Rosebud({ apiBaseUrl: remote.base });
+  const root = await directory(t, {
+    "index.html": "<p>Game</p>",
+    ".gitignore": "node_modules",
+  });
+  await assert.rejects(
+    client.publish({ directory: root }),
+    (e) =>
+      e.code === "unsafe_path" &&
+      e.message.includes(".gitignore") &&
+      e.message.includes("./dist"),
+  );
+  assert.throws(
+    () => outsideBuild("/game/.rosebud/project.json", "/game", posix),
+    (e) => e.code === "state_in_build" && e.message.includes("./dist"),
+  );
+  assert.equal(remote.requests.length, 0);
+});
