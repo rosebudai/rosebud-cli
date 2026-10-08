@@ -38,6 +38,3 @@ jobs:
             *) dist_tag=latest ;;
           esac
           npm publish --provenance --access public --tag "$dist_tag"
-        env:
-          # Unset once npm trusted publishing is configured for the package.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
