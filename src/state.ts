@@ -34,6 +34,24 @@ export interface Credentials {
     expected_version: string;
   };
 }
+/** The account login, one per API origin, kept apart from project credentials. */
+export interface AccountCredentials {
+  version: 1;
+  api_base_url: string;
+  login_id: string;
+  token: string;
+  approval_url?: string;
+}
+/** An asset create saved before its job is sent, so a retry cannot pay twice. */
+export interface AssetRequest {
+  version: 1;
+  api_base_url: string;
+  fingerprint: string;
+  quote_id: string;
+  idempotency_key: string;
+  credits: number;
+  job_id?: string;
+}
 function missing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
@@ -73,7 +91,7 @@ export async function readState<T>(path: string): Promise<T | undefined> {
 }
 export async function saveState(
   path: string,
-  data: ProjectHandle | Credentials,
+  data: ProjectHandle | Credentials | AccountCredentials | AssetRequest,
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   try {
@@ -108,24 +126,39 @@ export async function saveState(
     throw error;
   }
 }
+export async function removeState(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (!missing(error)) throw error;
+  }
+}
+function credentialFile(name: string, parts: string[]): string {
+  const key = createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+  return join(
+    process.env.ROSEBUD_CREDENTIALS_DIR ??
+      join(homedir(), ".config", "rosebud", "credentials"),
+    `${name}${key}.json`,
+  );
+}
 export function credentialPath(
   statePath: string,
   handle: ProjectHandle,
 ): string {
-  const key = createHash("sha256")
-    .update(
-      JSON.stringify([
-        resolve(statePath),
-        handle.api_base_url,
-        handle.project_id,
-      ]),
-    )
-    .digest("hex");
-  return join(
-    process.env.ROSEBUD_CREDENTIALS_DIR ??
-      join(homedir(), ".config", "rosebud", "credentials"),
-    `${key}.json`,
-  );
+  return credentialFile("", [
+    resolve(statePath),
+    handle.api_base_url,
+    handle.project_id,
+  ]);
+}
+export function accountPath(apiBaseUrl: string): string {
+  return credentialFile("account-", [apiBaseUrl]);
+}
+export function assetRequestPath(
+  apiBaseUrl: string,
+  fingerprint: string,
+): string {
+  return credentialFile("asset-", [apiBaseUrl, fingerprint]);
 }
 export async function prepareCredentials(path: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });

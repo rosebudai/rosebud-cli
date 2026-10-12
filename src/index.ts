@@ -1,4 +1,6 @@
-import { open } from "node:fs/promises";
+import { link, mkdir, open, rename, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import { prepareBundle } from "./bundle.js";
 import { inputError, isObject, RosebudError } from "./errors.js";
 import type { JsonValue } from "./errors.js";
@@ -93,6 +95,70 @@ export interface UpdateResult {
   content_version: string;
   operation_id: string;
 }
+export interface LoginOptions {
+  client?: AgentClient;
+  name?: string;
+  signal?: AbortSignal;
+}
+export interface LoginResult {
+  login_id: string;
+  token: string;
+  approval_url: string;
+  status: "pending";
+  expires_at: string;
+}
+/** An account login token (`rbk_...`), or an API key made in Rosebud. */
+export interface AccountAuthorization {
+  token: string;
+  signal?: AbortSignal;
+}
+export interface LoginStatus {
+  login_id: string | null;
+  status: "pending" | "active" | "expired" | "revoked";
+  expires_at: string | null;
+  [key: string]: JsonValue;
+}
+export interface AssetModelInput {
+  name: string;
+  type: string;
+  required: boolean;
+  [key: string]: JsonValue;
+}
+export interface AssetModel {
+  id: string;
+  inputs: AssetModelInput[];
+  [key: string]: JsonValue;
+}
+export interface AssetQuote {
+  id: string;
+  model: string;
+  credits: number;
+  expires_at: string;
+  [key: string]: JsonValue;
+}
+export interface Asset {
+  id: string;
+  /** Public file link, or an API path that needs the caller's credential. */
+  url: string;
+  [key: string]: JsonValue;
+}
+export interface AssetJob {
+  id: string;
+  /** queued and running are unfinished; succeeded, failed and canceled are final. */
+  status: string;
+  asset: Asset | null;
+  error: { code: string; message: string } | null;
+  [key: string]: JsonValue;
+}
+export interface AssetDownloadOptions {
+  /** An asset's `url`; API paths are resolved against the API origin. */
+  url: string;
+  path: string;
+  /** Sent only to the API origin, never to file storage. */
+  token?: string;
+  overwrite?: boolean;
+  signal?: AbortSignal;
+}
 
 function httpUrl(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -138,12 +204,9 @@ async function readResponse(response: Response): Promise<string> {
   }
 }
 
+const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 function projectPath(projectId: string): string {
-  if (
-    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
-      projectId,
-    )
-  )
+  if (!uuid.test(projectId))
     throw inputError("project_id", "Use the project_id returned by Rosebud.");
   return `/api/developer/projects/${projectId.toLowerCase()}`;
 }
@@ -154,6 +217,67 @@ function validateToken(token: string): void {
       "Use the private agent credential returned by connect.",
     );
 }
+function validateAccountToken(token: string): void {
+  if (!/^rbk_[A-Za-z0-9_-]{43}$/.test(token))
+    throw inputError(
+      "account_token",
+      "Use the private login credential saved by rosebud login.",
+    );
+}
+function uuidPath(base: string, id: string, label: string): string {
+  if (!uuid.test(id))
+    throw inputError(
+      `${label}_id`,
+      `Use the ${label} id returned by Rosebud, a UUID.`,
+    );
+  return `${base}${id.toLowerCase()}/`;
+}
+function withQuery(path: string, query: Record<string, string | undefined>) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query))
+    if (value !== undefined) search.set(key, value);
+  return search.size ? `${path}?${search}` : path;
+}
+function isJob(body: Record<string, JsonValue>): boolean {
+  return (
+    typeof body.id === "string" &&
+    typeof body.status === "string" &&
+    (body.asset === null ||
+      (isObject(body.asset) && typeof body.asset.url === "string")) &&
+    (body.error === null || isObject(body.error))
+  );
+}
+/** Rosebud's error shapes: `{error: {code, message}}` and `{detail, code}`. */
+function apiError(status: number, result: JsonValue): RosebudError {
+  const detail = isObject(result)
+    ? isObject(result.error)
+      ? { message: result.error.message, code: result.error.code }
+      : { message: result.detail, code: result.code }
+    : undefined;
+  return new RosebudError(
+    typeof detail?.message === "string"
+      ? detail.message
+      : `Rosebud API returned HTTP ${status}.`,
+    {
+      kind: "api",
+      code: typeof detail?.code === "string" ? detail.code : "http_error",
+      outcome: status >= 400 && status < 500 ? "rejected" : "unknown",
+      status,
+      body: result,
+    },
+  );
+}
+function downloadInterrupted(signal: AbortSignal): RosebudError {
+  return new RosebudError(
+    "The download was interrupted and no file was saved. Run the command again to retry it.",
+    {
+      kind: "transport",
+      code: signal.aborted ? "aborted" : "network_error",
+      outcome: "unknown",
+    },
+  );
+}
+const downloadLimit = 512 * 1024 * 1024;
 function unexpected(): never {
   throw new RosebudError(
     "The API returned an unexpected response. The operation may have completed; no retry was attempted.",
@@ -401,6 +525,314 @@ export class Rosebud {
     );
   }
 
+  /** Start an account login; nothing works until a signed-in person approves it. */
+  async login(options: LoginOptions = {}): Promise<LoginResult> {
+    if (
+      options.name !== undefined &&
+      (typeof options.name !== "string" ||
+        !options.name.trim() ||
+        options.name.length > 80)
+    )
+      throw inputError(
+        "name",
+        "Use a nonempty login name of at most 80 characters.",
+      );
+    const body = await this.request(
+      "/api/v1/agent-logins/",
+      "POST",
+      JSON.stringify({
+        client: options.client ?? "unknown",
+        ...(options.name !== undefined ? { name: options.name } : {}),
+      }),
+      undefined,
+      options.signal,
+    );
+    if (
+      typeof body.login_id !== "string" ||
+      typeof body.token !== "string" ||
+      !/^rbk_[A-Za-z0-9_-]{43}$/.test(body.token) ||
+      !httpUrl(body.approval_url) ||
+      body.status !== "pending" ||
+      typeof body.expires_at !== "string"
+    )
+      unexpected();
+    return body as unknown as LoginResult;
+  }
+
+  async loginStatus(options: AccountAuthorization): Promise<LoginStatus> {
+    validateAccountToken(options.token);
+    const body = await this.request(
+      "/api/v1/agent-logins/current/",
+      "GET",
+      undefined,
+      options.token,
+      options.signal,
+    );
+    if (
+      !["pending", "active", "expired", "revoked"].includes(String(body.status))
+    )
+      unexpected();
+    return body as unknown as LoginStatus;
+  }
+
+  /** Cancel a pending login or revoke an approved one. */
+  async logout(options: AccountAuthorization): Promise<void> {
+    validateAccountToken(options.token);
+    await this.request(
+      "/api/v1/agent-logins/current/",
+      "DELETE",
+      undefined,
+      options.token,
+      options.signal,
+    );
+  }
+
+  async assetModels(
+    options: { category?: string; signal?: AbortSignal } = {},
+  ): Promise<{ models: AssetModel[]; [key: string]: JsonValue }> {
+    const body = await this.request(
+      withQuery("/api/v1/asset-models/", { category: options.category }),
+      "GET",
+      undefined,
+      undefined,
+      options.signal,
+    );
+    if (!Array.isArray(body.models)) unexpected();
+    return body as { models: AssetModel[]; [key: string]: JsonValue };
+  }
+
+  async assetModel(options: {
+    model: string;
+    signal?: AbortSignal;
+  }): Promise<AssetModel> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(options.model))
+      throw inputError("model", "Use a model id from rosebud assets models.");
+    const body = await this.request(
+      `/api/v1/asset-models/${options.model}/`,
+      "GET",
+      undefined,
+      undefined,
+      options.signal,
+    );
+    if (
+      body.id !== options.model ||
+      !Array.isArray(body.inputs) ||
+      !body.inputs.every(
+        (field) =>
+          isObject(field) &&
+          typeof field.name === "string" &&
+          typeof field.type === "string",
+      )
+    )
+      unexpected();
+    return body as unknown as AssetModel;
+  }
+
+  /** Validate inputs and freeze the price for a few minutes; quoting is free. */
+  async quoteAsset(
+    options: AccountAuthorization & {
+      model: string;
+      input: Record<string, JsonValue>;
+    },
+  ): Promise<AssetQuote> {
+    validateAccountToken(options.token);
+    const body = await this.request(
+      "/api/v1/asset-quotes/",
+      "POST",
+      JSON.stringify({ model: options.model, input: options.input }),
+      options.token,
+      options.signal,
+    );
+    if (
+      typeof body.id !== "string" ||
+      !uuid.test(body.id) ||
+      typeof body.credits !== "number" ||
+      typeof body.expires_at !== "string"
+    )
+      unexpected();
+    return body as unknown as AssetQuote;
+  }
+
+  /** Pay for a quote and start its job. Repeating the same key returns the same job. */
+  async createAssetJob(
+    options: AccountAuthorization & {
+      quoteId: string;
+      idempotencyKey: string;
+    },
+  ): Promise<AssetJob> {
+    validateAccountToken(options.token);
+    uuidPath("", options.quoteId, "quote");
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(options.idempotencyKey))
+      throw inputError(
+        "idempotency_key",
+        "Use 1-128 letters, digits, '.', '_', ':' or '-' as the idempotency key.",
+      );
+    const body = await this.request(
+      "/api/v1/asset-jobs/",
+      "POST",
+      JSON.stringify({
+        quote_id: options.quoteId,
+        idempotency_key: options.idempotencyKey,
+      }),
+      options.token,
+      options.signal,
+    );
+    if (!isJob(body)) unexpected();
+    return body as unknown as AssetJob;
+  }
+
+  async assetJob(
+    options: AccountAuthorization & { jobId: string },
+  ): Promise<AssetJob> {
+    validateAccountToken(options.token);
+    const body = await this.request(
+      uuidPath("/api/v1/asset-jobs/", options.jobId, "job"),
+      "GET",
+      undefined,
+      options.token,
+      options.signal,
+    );
+    if (!isJob(body) || body.id !== options.jobId.toLowerCase()) unexpected();
+    return body as unknown as AssetJob;
+  }
+
+  /** The account's assets, newest first, one page at a time. */
+  async listAssets(
+    options: AccountAuthorization & { query?: string; category?: string },
+  ): Promise<{ results: Asset[]; [key: string]: JsonValue }> {
+    validateAccountToken(options.token);
+    const body = await this.request(
+      withQuery("/api/v1/assets/", {
+        q: options.query,
+        category: options.category,
+      }),
+      "GET",
+      undefined,
+      options.token,
+      options.signal,
+    );
+    if (!Array.isArray(body.results)) unexpected();
+    return body as { results: Asset[]; [key: string]: JsonValue };
+  }
+
+  async asset(
+    options: AccountAuthorization & { assetId: string },
+  ): Promise<Asset> {
+    validateAccountToken(options.token);
+    const body = await this.request(
+      uuidPath("/api/v1/assets/", options.assetId, "asset"),
+      "GET",
+      undefined,
+      options.token,
+      options.signal,
+    );
+    if (typeof body.id !== "string" || typeof body.url !== "string")
+      unexpected();
+    return body as unknown as Asset;
+  }
+
+  /** Save an asset's file. Without `overwrite`, an existing file is never replaced. */
+  async downloadAsset(options: AssetDownloadOptions): Promise<number> {
+    let url: URL;
+    try {
+      url = new URL(options.url, this.apiBaseUrl);
+    } catch {
+      unexpected();
+    }
+    const own = url.origin === this.apiBaseUrl;
+    if (
+      !httpUrl(url.href) ||
+      (url.protocol === "http:" &&
+        !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+    )
+      unexpected();
+    if (own && options.token !== undefined) validateAccountToken(options.token);
+    if (options.signal?.aborted)
+      throw inputError("aborted", "Download cancelled before sending.");
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([timeout, options.signal])
+      : timeout;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        signal,
+        // A redirect must not carry the credential anywhere else.
+        redirect: own ? "manual" : "follow",
+        headers:
+          own && options.token
+            ? { Authorization: `Bearer ${options.token}` }
+            : {},
+      });
+    } catch {
+      throw downloadInterrupted(signal);
+    }
+    if (!response.ok || !response.body) {
+      let text = "";
+      try {
+        text = await readResponse(response);
+      } catch {
+        // The status alone explains the failure.
+      }
+      let result: JsonValue = text;
+      try {
+        result = JSON.parse(text) as JsonValue;
+      } catch {
+        // Storage errors are not JSON.
+      }
+      throw apiError(response.status, own ? result : null);
+    }
+    await mkdir(dirname(options.path), { recursive: true });
+    const temporary = `${options.path}.${randomUUID()}.part`;
+    let size = 0;
+    try {
+      const file = await open(temporary, "wx");
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          let chunk: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            chunk = await reader.read();
+          } catch {
+            throw downloadInterrupted(signal);
+          }
+          if (chunk.done) break;
+          size += chunk.value.byteLength;
+          if (size > downloadLimit) {
+            await reader.cancel();
+            throw new RosebudError(
+              "The asset file exceeded 512 MiB and was not saved.",
+              { kind: "response", code: "file_too_large", outcome: "rejected" },
+            );
+          }
+          await file.write(chunk.value);
+        }
+      } finally {
+        reader.releaseLock();
+        await file.close();
+      }
+      if (options.overwrite) await rename(temporary, options.path);
+      else
+        try {
+          await link(temporary, options.path);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "EEXIST"
+          )
+            throw inputError(
+              "file_exists",
+              "The output file already exists. Choose another path or pass --force to replace it.",
+            );
+          throw error;
+        }
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+    return size;
+  }
+
   private async request(
     path: string,
     method: string,
@@ -447,25 +879,7 @@ export class Rosebud {
     } catch {
       result = text;
     }
-    if (!response.ok) {
-      const detail =
-        isObject(result) && isObject(result.error) ? result.error : undefined;
-      throw new RosebudError(
-        typeof detail?.message === "string"
-          ? detail.message
-          : `Rosebud API returned HTTP ${response.status}.`,
-        {
-          kind: "api",
-          code: typeof detail?.code === "string" ? detail.code : "http_error",
-          outcome:
-            response.status >= 400 && response.status < 500
-              ? "rejected"
-              : "unknown",
-          status: response.status,
-          body: result,
-        },
-      );
-    }
+    if (!response.ok) throw apiError(response.status, result);
     if (!isObject(result)) unexpected();
     return result;
   }
