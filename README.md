@@ -118,7 +118,7 @@ Generate game art, skyboxes, 3D models, sound effects and music with the person'
 rosebud login --agent-client codex
 ```
 
-`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, its daily credit cap and what it spent in the last 24 hours. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works only with the person's assets and asset generation, within the daily cap; it cannot publish games, change billing or manage the account. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
+`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works only with the person's assets and asset generation, paid from their credits; it cannot publish games, change billing or manage the account. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
 
 Choose a model, check the price, then make the asset:
 
@@ -149,7 +149,7 @@ The login is stored with the other credentials, separate from project connection
 | `rosebud update --directory ./dist`                               | Releases a changed build to the saved project and play URL.              |
 | `rosebud disconnect`                                              | Revokes this agent's connection; the published game stays playable.      |
 | `rosebud login`                                                   | Requests the person's approval to make assets with their credits.        |
-| `rosebud whoami`                                                  | Reports the login's status, daily credit cap and recent spend.           |
+| `rosebud whoami`                                                  | Reports the login's status and the person's credit balance.              |
 | `rosebud logout`                                                  | Revokes the login and removes it from this machine.                      |
 | `rosebud assets models`                                           | Lists models with their inputs, prices and licenses.                     |
 | `rosebud assets quote --model <id> --prompt <text>`               | Checks inputs and prices an asset without charging.                      |

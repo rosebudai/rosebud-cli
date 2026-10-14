@@ -116,9 +116,7 @@ async function rosebud(t) {
         client: "codex",
         name: "Moon Garden agent",
         expires_at: active ? null : "2030-01-01T00:30:00Z",
-        daily_credit_cap: active ? 10000 : null,
-        spent_last_24h: active ? 0 : null,
-        account: active ? { display_name: "Mei" } : null,
+        account: active ? { display_name: "Mei", balance: 5000 } : null,
       });
       return;
     }
@@ -137,8 +135,6 @@ async function rosebud(t) {
           credits: body.input.asset_type === "sprite" ? 300 : 250,
           balance: 5000,
           payment_required: false,
-          key_cap: null,
-          over_key_cap: false,
           expires_at: "2030-01-01T00:10:00Z",
         },
         201,
@@ -273,8 +269,7 @@ test("login waits for the person's approval, whoami reports it and logout forget
   const active = await cli(root, api, ["whoami"]);
   assert.equal(active.code, 0, active.stderr);
   assert.equal(active.data.status, "active");
-  assert.equal(active.data.daily_credit_cap, 10000);
-  assert.equal(active.data.spent_last_24h, 0);
+  assert.equal(active.data.account.balance, 5000);
   assert.equal(active.data.approval_url, undefined);
   // Logging in again reports the active login instead of replacing it.
   const again = await cli(root, api, ["login"]);
