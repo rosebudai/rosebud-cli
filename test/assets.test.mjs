@@ -3,12 +3,14 @@ import { test } from "node:test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import {
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
   realpath,
   stat,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +21,8 @@ import { randomUUID } from "node:crypto";
 const token = `rbk_${"T".repeat(43)}`;
 const approval = `https://example.invalid/connect/assets#${"S".repeat(43)}`;
 const sprite = Buffer.from("sprite zip bytes");
+const projectId = randomUUID();
+const agentToken = "A".repeat(43);
 const model = {
   id: "flux-2-flash",
   name: "Flux 2 Flash",
@@ -43,7 +47,8 @@ function json(res, body, status = 200) {
 
 /**
  * A fake Rosebud asset API; `api.loseJobResponse` drops one job admission reply and
- * each `api.throttle` entry refuses one quote with that Retry-After.
+ * each `api.throttle` entry refuses one quote with that Retry-After. Publishing
+ * with an active login answers with the account's game.
  */
 async function rosebud(t) {
   const api = {
@@ -55,6 +60,8 @@ async function rosebud(t) {
     downloads: [],
     loseJobResponse: false,
     throttle: [],
+    publishes: [],
+    statusChecks: [],
   };
   const job = (id) => {
     const row = api.jobs.get(id);
@@ -81,8 +88,43 @@ async function rosebud(t) {
   const app = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
     const path = new URL(req.url, "http://fake").pathname;
+    if (path === "/api/developer/projects/import/") {
+      api.publishes.push(req.headers.authorization);
+      if (api.login === "pending") {
+        const error = { code: "login_pending", message: "Approve first." };
+        json(res, { error }, 403);
+        return;
+      }
+      json(
+        res,
+        {
+          project_id: projectId,
+          play_url: "https://example.invalid/p/moss-garden",
+          editor_url: `https://example.invalid/edit/${projectId}`,
+          content_version: "v1",
+          claimed: true,
+          owner: "Mei",
+          agent_token: agentToken,
+          connection_expires_at: "2031-01-01T00:00:00Z",
+        },
+        201,
+      );
+      return;
+    }
+    if (path === `/api/developer/projects/${projectId}/connection/`) {
+      api.statusChecks.push(req.headers.authorization);
+      json(res, {
+        project_id: projectId,
+        connection_id: randomUUID(),
+        status: "active",
+        expires_at: "2031-01-01T00:00:00Z",
+        content_version: "v1",
+        play_url: "https://example.invalid/p/moss-garden",
+      });
+      return;
+    }
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
     if (path === "/api/v1/agent-logins/") {
       api.logins.push(body);
       api.login = "pending";
@@ -429,4 +471,43 @@ test("throttled requests wait out Retry-After, and a long wait is reported", asy
   assert.equal(refused.error.code, "throttled");
   assert.equal(refused.error.retry_after_seconds, 120);
   assert.equal(api.quotes.length, 1);
+});
+
+async function game(root) {
+  await mkdir(join(root, "dist"));
+  await writeFile(join(root, "dist", "index.html"), "<h1>Moss garden</h1>");
+}
+
+test("a logged-in publish lands in the person's account, ready for update", async (t) => {
+  const { root, api } = await loggedIn(t);
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 0, published.stderr);
+  assert.deepEqual(api.publishes, [`Bearer ${token}`]);
+  assert.equal(published.data.claimed, true);
+  assert.equal(published.data.owner, "Mei");
+  assert.match(published.data.next_action, /nothing to claim/);
+  assert.ok(!("claim_url" in published.data));
+  assert.ok(!published.stdout.includes(agentToken));
+  const handle = JSON.parse(
+    await readFile(join(root, ".rosebud", "project.json"), "utf8"),
+  );
+  assert.equal(handle.project_id, projectId);
+  assert.ok(!("claim_expires_at" in handle));
+  // The saved connection works at once, with no rosebud connect.
+  const status = await cli(root, api, ["status"]);
+  assert.equal(status.code, 0, status.stderr);
+  assert.equal(status.data.status, "active");
+  assert.deepEqual(api.statusChecks, [`Bearer ${agentToken}`]);
+});
+
+test("a publish with a login still waiting for approval saves nothing", async (t) => {
+  const root = await workspace(t);
+  const api = await rosebud(t);
+  assert.equal((await cli(root, api, ["login"])).code, 0);
+  await game(root);
+  const refused = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(refused.code, 3);
+  assert.equal(refused.error.code, "login_pending");
+  await assert.rejects(stat(join(root, ".rosebud", "project.json")));
 });

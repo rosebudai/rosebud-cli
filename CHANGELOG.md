@@ -4,6 +4,7 @@
 
 - Log in once with `rosebud login`: the person approves a private link, with no API key to copy. `rosebud whoami` shows the login's status and the person's credit balance, and `rosebud logout` revokes it.
 - Make game assets with the person's Rosebud credits: `rosebud assets models`, `quote`, `create`, `status`, `list` and `download`. `create` refuses quotes above `--max-credits`, waits for the job, saves the file with `--out`, and resumes the same job when you rerun an interrupted command.
+- After `rosebud login` is approved, `rosebud publish` puts the game straight into the person's account and saves the update connection: no claim link and no `rosebud connect`.
 - Throttled asset requests wait out Rosebud's `Retry-After` and send again, for up to a minute; longer waits report `retry_after_seconds`.
 
 ## 0.1.0

@@ -6,7 +6,7 @@ Requires Node.js 22+ and npm. Rosebud is built in as the publishing destination;
 
 ## For coding agents
 
-Use the `rosebud` command to publish. Build and test the game locally, publish it once with a useful title and description, then run `rosebud connect`. Give the private approval link to the person, who signs in and explicitly approves access to this game. On later sessions, use the saved project and `rosebud update`. A connection or update error is a reason to inspect `rosebud status`, not to create another project.
+Use the `rosebud` command to publish. Build and test the game locally, then publish it once with a useful title and description. If `rosebud whoami` shows an active login, the game goes straight into that person's account: there is nothing to claim or connect, and `rosebud update` works at once. Otherwise, run `rosebud connect` and give the private approval link to the person, who signs in and explicitly approves access to this game. On later sessions, use the saved project and `rosebud update`. A connection or update error is a reason to inspect `rosebud status`, not to create another project.
 
 The CLI handles packaging, credentials, the saved project handle and update operation IDs. Run commands from the same project directory, or consistently pass `--state /private/path/project.json`. Keep terminal results private because they can contain claim and approval links.
 
@@ -35,7 +35,7 @@ No build step? Copy the files your game needs (`index.html` and everything it lo
 
 For the supplied sample, use `--directory ./examples/signal-garden`. For an existing archive, use `--zip ./game.zip`. Add `--thumbnail ./cover.png` to supply a gameplay screenshot; omitting it keeps the existing placeholder.
 
-`publish` creates a game and saves `.rosebud/project.json` outside the build directory. Its JSON result includes a public `play_url` and private `claim_url`. `connect` returns a private `approval_url`: give it to the intended owner, who signs in and explicitly approves permission to update this one game. An unclaimed game can be claimed and connected in the same action. Visiting the link or signing in alone does not approve access.
+`publish` creates a game and saves `.rosebud/project.json` outside the build directory. With an active `rosebud login`, the game goes straight into that person's account: the result has `claimed: true`, the `owner` and an `editor_url`, the update connection is saved, and you skip `connect`. Without a login, the JSON result includes a public `play_url` and private `claim_url`. `connect` returns a private `approval_url`: give it to the intended owner, who signs in and explicitly approves permission to update this one game. An unclaimed game can be claimed and connected in the same action. Visiting the link or signing in alone does not approve access.
 
 After the person approves, and whenever a later agent session returns:
 
@@ -118,7 +118,7 @@ Generate game art, skyboxes, 3D models, sound effects and music with the person'
 rosebud login --agent-client codex
 ```
 
-`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works only with the person's assets and asset generation, paid from their credits; it cannot publish games, change billing or manage the account. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
+`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works with the person's assets and asset generation, paid from their credits, and `rosebud publish` puts new games in their account. It cannot change billing or manage the account. A publish with a login that still waits for approval fails with `login_pending`; approve it, or run `rosebud logout` to publish with a claim link instead. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
 
 Choose a model, check the price, then make the asset:
 

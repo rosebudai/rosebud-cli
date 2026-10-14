@@ -6,7 +6,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { prepareBundle } from "./bundle.js";
-import { Rosebud, RosebudError, readCover } from "./index.js";
+import {
+  Rosebud,
+  RosebudError,
+  publishedToAccount,
+  readCover,
+} from "./index.js";
 import type {
   AdoptionContext,
   AgentClient,
@@ -56,7 +61,9 @@ Uploads: exactly one --directory or --zip; optional --title, --description, --th
 Optional first-upload context: --context <JSON file>, --agent-client <client>.
 --name remains a title alias. Rosebud is the default destination; no configuration needed.
 
-publish creates one new game and saves its handle. Unclaimed games expire after one
+publish creates one new game and saves its handle. After rosebud login is approved,
+publish puts the game straight into that person's account and update works at once:
+no claim or connect step. Without a login, unclaimed games expire after one
 hour and are permanently deleted. The result includes claim_expires_at; claim before
 then to keep the same link. After expiry, upload your local build with a fresh
 --state file to create a new game and link. The old game cannot be recovered.
@@ -270,9 +277,14 @@ async function main(): Promise<void> {
       });
       outsideBuild(destination, directory);
       await prepareCredentials(destination);
+      const login = await readAccount(
+        accountPath(api.apiBaseUrl),
+        api.apiBaseUrl,
+      );
       const result = await api.publish({
         ...input,
         ...metadata,
+        ...(login ? { token: login.token } : {}),
         context: {
           ...supplied,
           ...(client !== "unknown"
@@ -287,12 +299,28 @@ async function main(): Promise<void> {
         api_base_url: api.apiBaseUrl,
         project_id: result.project_id,
         play_url: result.play_url,
-        claim_expires_at: result.claim_expires_at,
         content_version: result.content_version,
       };
+      if (!publishedToAccount(result))
+        handle.claim_expires_at = result.claim_expires_at;
       const path = credentialPath(statePath, handle);
       outsideBuild(path, directory);
       await prepareCredentials(path);
+      if (publishedToAccount(result)) {
+        const { agent_token: agentToken, ...shown } = result;
+        await saveState(path, {
+          api_base_url: api.apiBaseUrl,
+          project_id: result.project_id,
+          agent_token: agentToken,
+        });
+        await saveState(statePath, handle);
+        output({
+          ...shown,
+          state_file: statePath,
+          next_action: `This game is in ${result.owner}'s Rosebud account; nothing to claim. Ship new builds to the same link with rosebud update and this state file.`,
+        });
+        return;
+      }
       await saveState(path, {
         api_base_url: api.apiBaseUrl,
         project_id: result.project_id,

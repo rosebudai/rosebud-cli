@@ -50,14 +50,36 @@ export interface GameMetadata {
 export type BundleInput =
   { directory: string; zip?: never } | { zip: string; directory?: never };
 export type PublishOptions = BundleInput &
-  GameMetadata & { context?: AdoptionContext; signal?: AbortSignal };
-export interface PublishResult {
+  GameMetadata & {
+    context?: AdoptionContext;
+    /** A `rosebud login` token: the game goes straight into that account. */
+    token?: string;
+    signal?: AbortSignal;
+  };
+interface PublishedGame {
   project_id: string;
   play_url: string;
-  claim_url: string;
-  claim_expires_at: string;
   content_version: string;
   [key: string]: JsonValue;
+}
+/** Published without a login: a person keeps the game by following `claim_url`. */
+export interface ClaimLinkResult extends PublishedGame {
+  claim_url: string;
+  claim_expires_at: string;
+}
+/** Published with a login: the game is already in `owner`'s account. */
+export interface AccountPublishResult extends PublishedGame {
+  claimed: true;
+  owner: string;
+  editor_url: string;
+  agent_token: string;
+  connection_expires_at: string;
+}
+export type PublishResult = ClaimLinkResult | AccountPublishResult;
+export function publishedToAccount(
+  result: PublishResult,
+): result is AccountPublishResult {
+  return result.claimed === true;
 }
 export interface ConnectionOptions {
   projectId: string;
@@ -425,21 +447,33 @@ export class Rosebud {
     const form = await gameForm(options);
     if (options.context !== undefined)
       form.append("context", JSON.stringify(options.context));
+    if (options.token !== undefined) validateAccountToken(options.token);
     const body = await this.request(
       "/api/developer/projects/import/",
       "POST",
       form,
-      undefined,
+      options.token,
       options.signal,
     );
+    // Rosebud answers a login with the account's game, and falls back to a
+    // claim link if it could not claim it.
+    const claimed =
+      body.claimed === true &&
+      typeof body.owner === "string" &&
+      httpUrl(body.editor_url) &&
+      typeof body.agent_token === "string" &&
+      /^[A-Za-z0-9_-]{43}$/.test(body.agent_token) &&
+      typeof body.connection_expires_at === "string";
+    const claimLink =
+      httpUrl(body.claim_url) &&
+      typeof body.claim_expires_at === "string" &&
+      Number.isFinite(Date.parse(body.claim_expires_at));
     if (
       typeof body.project_id !== "string" ||
       !body.project_id ||
       !httpUrl(body.play_url) ||
-      !httpUrl(body.claim_url) ||
-      typeof body.claim_expires_at !== "string" ||
-      !Number.isFinite(Date.parse(body.claim_expires_at)) ||
-      typeof body.content_version !== "string"
+      typeof body.content_version !== "string" ||
+      !(claimed || claimLink)
     )
       unexpected();
     return body as unknown as PublishResult;
