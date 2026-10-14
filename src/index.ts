@@ -1,6 +1,7 @@
 import { link, mkdir, open, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { prepareBundle } from "./bundle.js";
 import { inputError, isObject, RosebudError } from "./errors.js";
 import type { JsonValue } from "./errors.js";
@@ -248,7 +249,11 @@ function isJob(body: Record<string, JsonValue>): boolean {
   );
 }
 /** Rosebud's error shapes: `{error: {code, message}}` and `{detail, code}`. */
-function apiError(status: number, result: JsonValue): RosebudError {
+function apiError(
+  status: number,
+  result: JsonValue,
+  retryAfter?: string | null,
+): RosebudError {
   const detail = isObject(result)
     ? isObject(result.error)
       ? { message: result.error.message, code: result.error.code }
@@ -264,9 +269,14 @@ function apiError(status: number, result: JsonValue): RosebudError {
       outcome: status >= 400 && status < 500 ? "rejected" : "unknown",
       status,
       body: result,
+      ...(status === 429 && retryAfter && /^\d+$/.test(retryAfter)
+        ? { retryAfterSeconds: Number(retryAfter) }
+        : {}),
     },
   );
 }
+/** How long JSON requests wait out throttling, in total, before reporting it. */
+const throttleBudgetMs = 60_000;
 function downloadInterrupted(signal: AbortSignal): RosebudError {
   return new RosebudError(
     "The download was interrupted and no file was saved. Run the command again to retry it.",
@@ -840,6 +850,36 @@ export class Rosebud {
     token?: string,
     cancellation?: AbortSignal,
   ): Promise<Record<string, JsonValue>> {
+    let waitedMs = 0;
+    for (;;) {
+      try {
+        return await this.send(path, method, body, token, cancellation);
+      } catch (error) {
+        // Throttling refuses a request before Rosebud acts on it, so a JSON
+        // request is sent again once the window reopens. Uploads never are.
+        const waitMs =
+          error instanceof RosebudError &&
+          error.retryAfterSeconds !== undefined &&
+          !(body instanceof FormData)
+            ? (error.retryAfterSeconds + 1) * 1000
+            : undefined;
+        if (waitMs === undefined || waitedMs + waitMs > throttleBudgetMs)
+          throw error;
+        await sleep(waitMs, undefined, { signal: cancellation }).catch(
+          () => undefined,
+        );
+        waitedMs += waitMs;
+      }
+    }
+  }
+
+  private async send(
+    path: string,
+    method: string,
+    body?: FormData | string,
+    token?: string,
+    cancellation?: AbortSignal,
+  ): Promise<Record<string, JsonValue>> {
     if (cancellation?.aborted)
       throw inputError("aborted", "Request cancelled before sending.");
     const timeout = AbortSignal.timeout(this.timeoutMs);
@@ -879,7 +919,12 @@ export class Rosebud {
     } catch {
       result = text;
     }
-    if (!response.ok) throw apiError(response.status, result);
+    if (!response.ok)
+      throw apiError(
+        response.status,
+        result,
+        response.headers.get("Retry-After"),
+      );
     if (!isObject(result)) unexpected();
     return result;
   }

@@ -1045,7 +1045,7 @@ main().catch((error: unknown) => {
           { kind: "response", code: "unexpected_error", outcome: "unknown" },
         );
   process.stderr.write(
-    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...apiDetails(known), ...errorContext } })}\n`,
+    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...apiDetails(known), ...errorContext } })}\n`,
   );
   process.exitCode =
     known.outcome === "unknown"

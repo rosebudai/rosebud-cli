@@ -41,7 +41,10 @@ function json(res, body, status = 200) {
     .end(JSON.stringify(body));
 }
 
-/** A fake Rosebud asset API; `api.loseJobResponse` drops one job admission reply. */
+/**
+ * A fake Rosebud asset API; `api.loseJobResponse` drops one job admission reply and
+ * each `api.throttle` entry refuses one quote with that Retry-After.
+ */
 async function rosebud(t) {
   const api = {
     login: "none",
@@ -51,6 +54,7 @@ async function rosebud(t) {
     jobs: new Map(),
     downloads: [],
     loseJobResponse: false,
+    throttle: [],
   };
   const job = (id) => {
     const row = api.jobs.get(id);
@@ -122,6 +126,21 @@ async function rosebud(t) {
     }
     if (api.login !== "active") {
       json(res, { detail: "Invalid key.", code: "invalid_key" }, 401);
+      return;
+    }
+    if (path === "/api/v1/asset-quotes/" && api.throttle.length) {
+      const seconds = api.throttle.shift();
+      res
+        .writeHead(429, {
+          "Content-Type": "application/json",
+          "Retry-After": String(seconds),
+        })
+        .end(
+          JSON.stringify({
+            detail: `Request was throttled. Expected available in ${seconds} seconds.`,
+            code: "throttled",
+          }),
+        );
       return;
     }
     if (path === "/api/v1/asset-quotes/") {
@@ -393,4 +412,21 @@ test("rerunning a create after a lost response resumes the same job without payi
     api.jobPosts[2].idempotency_key,
     api.jobPosts[0].idempotency_key,
   );
+});
+
+test("throttled requests wait out Retry-After, and a long wait is reported", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const request = ["--model", "flux-2-flash", "--prompt", "Mossy stone tile"];
+  api.throttle = [0];
+  const quote = await cli(root, api, ["assets", "quote", ...request]);
+  assert.equal(quote.code, 0, quote.stderr);
+  assert.equal(quote.data.credits, 250);
+  assert.equal(api.throttle.length, 0);
+
+  api.throttle = [120];
+  const refused = await cli(root, api, ["assets", "quote", ...request]);
+  assert.equal(refused.code, 3);
+  assert.equal(refused.error.code, "throttled");
+  assert.equal(refused.error.retry_after_seconds, 120);
+  assert.equal(api.quotes.length, 1);
 });

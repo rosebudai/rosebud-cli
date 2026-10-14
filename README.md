@@ -162,7 +162,7 @@ The login is stored with the other credentials, separate from project connection
 
 Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Rosebud is the default destination, and subsequent commands use the saved project connection.
 
-JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` when it reports them, so you know which file to fix. Asset errors include the `job_id` or `asset_id` once one is known. Exit codes:
+JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` when it reports them, so you know which file to fix. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. Uploads are never sent again. Exit codes:
 
 | Exit | Meaning                                                                                 |
 | ---- | --------------------------------------------------------------------------------------- |
