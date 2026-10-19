@@ -6,9 +6,11 @@ Requires Node.js 22+ and npm. Rosebud is built in as the publishing destination;
 
 ## For coding agents
 
-Use the `rosebud` command to publish. Build and test the game locally, publish it once with a useful title and description, then run `rosebud connect`. Give the private approval link to the person, who signs in and explicitly approves access to this game. On later sessions, use the saved project and `rosebud update`. A connection or update error is a reason to inspect `rosebud status`, not to create another project.
+Use the `rosebud` command to publish. Build and test the game locally, then publish it once with a useful title and description. If `rosebud whoami` shows an active login, the game goes straight into that person's account: there is nothing to claim or connect, and `rosebud update` works at once. Otherwise, run `rosebud connect` and give the private approval link to the person, who signs in and explicitly approves access to this game. On later sessions, use the saved project and `rosebud update`. A connection or update error is a reason to inspect `rosebud status`, not to create another project.
 
 The CLI handles packaging, credentials, the saved project handle and update operation IDs. Run commands from the same project directory, or consistently pass `--state /private/path/project.json`. Keep terminal results private because they can contain claim and approval links.
+
+To make art, audio or 3D models for the game, run `rosebud login` once and follow [Make assets](#make-assets).
 
 ## Quickstart
 
@@ -33,7 +35,7 @@ No build step? Copy the files your game needs (`index.html` and everything it lo
 
 For the supplied sample, use `--directory ./examples/signal-garden`. For an existing archive, use `--zip ./game.zip`. Add `--thumbnail ./cover.png` to supply a gameplay screenshot; omitting it keeps the existing placeholder.
 
-`publish` creates a game and saves `.rosebud/project.json` outside the build directory. Its JSON result includes a public `play_url` and private `claim_url`. `connect` returns a private `approval_url`: give it to the intended owner, who signs in and explicitly approves permission to update this one game. An unclaimed game can be claimed and connected in the same action. Visiting the link or signing in alone does not approve access.
+`publish` creates a game and saves `.rosebud/project.json` outside the build directory. With an active `rosebud login`, the game goes straight into that person's account: the result has `claimed: true`, the `owner` and an `editor_url`, the update connection is saved, and you skip `connect`. Without a login, the JSON result includes a public `play_url` and private `claim_url`. `connect` returns a private `approval_url`: give it to the intended owner, who signs in and explicitly approves permission to update this one game. An unclaimed game can be claimed and connected in the same action. Visiting the link or signing in alone does not approve access.
 
 After the person approves, and whenever a later agent session returns:
 
@@ -108,29 +110,66 @@ First publication has a separate limit: a lost response may leave a created game
 
 Pending connections expire after 30 minutes. Approved access lasts 90 days and can be revoked sooner. It permits files, metadata and ordinary branded publication for one project. It does not permit account-wide access, AI generation, billing changes or paid deployment capabilities.
 
+## Make assets
+
+Generate game art, skyboxes, 3D models, sound effects and music with the person's Rosebud credits. Log in once per machine:
+
+```sh
+rosebud login --agent-client codex
+```
+
+`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works with the person's assets and asset generation, paid from their credits, and `rosebud publish` puts new games in their account. It cannot change billing or manage the account. A publish with a login that still waits for approval fails with `login_pending`; approve it, or run `rosebud logout` to publish with a claim link instead. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
+
+Choose a model, check the price, then make the asset:
+
+```sh
+rosebud assets models --category image
+rosebud assets quote --model flux-2-flash --prompt 'Mossy stone tile, top-down' \
+  --input asset_type=sprite
+rosebud assets create --model flux-2-flash --prompt 'Mossy stone tile, top-down' \
+  --input asset_type=sprite --max-credits 300 --out ./dist/assets/stone-tile.png
+```
+
+`assets models` lists each model's inputs, price and license; `--category` narrows the list (for example `image`, `skybox`, `model_3d`, `sound_effect` or `music`). `--prompt` fills the model's `prompt` input, `--input name=value` sets any other input it lists (repeat it for several), and `--input-json ./input.json` supplies inputs as one JSON object. Quotes are free and check the inputs.
+
+`create` quotes, refuses a quote above `--max-credits`, starts the job, waits for it (up to `--timeout-ms`, default 600000) and saves the file to `--out`. It never replaces an existing file unless you pass `--force`. With `--no-wait` it returns the job at once; check it with `rosebud assets status <job_id>` and save the file with `rosebud assets download <asset_id> --out <path>`. `rosebud assets list` searches the person's existing assets with `--query` and `--category`.
+
+Credits are charged when a job starts and returned if generation fails. A failed job exits 3 with the reason. The CLI saves each create request, with its quote and idempotency key, before sending it. After an uncertain result (exit 4), including a wait that ran out, rerun the identical command: it resumes the same job instead of paying again. Once a create has finished, the same command makes a new asset. Identical creates run one at a time; to make variations in parallel, vary the prompt or inputs.
+
+The login is stored with the other credentials, separate from project connections, and is bound to the API origin.
+
 ## CLI reference
 
-| Command                              | Result                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------ |
-| `rosebud publish --directory ./dist` | Creates a new game and saves its project handle.                         |
-| `rosebud connect`                    | Requests owner approval for the saved project.                           |
-| `rosebud connect --project <id>`     | Requests a new connection to an existing game.                           |
-| `rosebud status`                     | Reports pending, active, revoked or expired access and content versions. |
-| `rosebud update --directory ./dist`  | Releases a changed build to the saved project and play URL.              |
-| `rosebud disconnect`                 | Revokes this agent's connection; the published game stays playable.      |
-| `rosebud --help`                     | Shows commands and options.                                              |
-| `rosebud --version`                  | Prints the installed CLI version.                                        |
+| Command                                                           | Result                                                                   |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `rosebud publish --directory ./dist`                              | Creates a new game and saves its project handle.                         |
+| `rosebud connect`                                                 | Requests owner approval for the saved project.                           |
+| `rosebud connect --project <id>`                                  | Requests a new connection to an existing game.                           |
+| `rosebud status`                                                  | Reports pending, active, revoked or expired access and content versions. |
+| `rosebud update --directory ./dist`                               | Releases a changed build to the saved project and play URL.              |
+| `rosebud disconnect`                                              | Revokes this agent's connection; the published game stays playable.      |
+| `rosebud login`                                                   | Requests the person's approval to make assets with their credits.        |
+| `rosebud whoami`                                                  | Reports the login's status and the person's credit balance.              |
+| `rosebud logout`                                                  | Revokes the login and removes it from this machine.                      |
+| `rosebud assets models`                                           | Lists models with their inputs, prices and licenses.                     |
+| `rosebud assets quote --model <id> --prompt <text>`               | Checks inputs and prices an asset without charging.                      |
+| `rosebud assets create --model <id> --prompt <text> --out <file>` | Makes an asset, waits for it and saves the file.                         |
+| `rosebud assets status <job_id>`                                  | Reports a job's progress and, when done, its asset.                      |
+| `rosebud assets list`                                             | Lists the person's assets, newest first.                                 |
+| `rosebud assets download <asset_id> --out <file>`                 | Saves an existing asset's file.                                          |
+| `rosebud --help`                                                  | Shows commands and options.                                              |
+| `rosebud --version`                                               | Prints the installed CLI version.                                        |
 
-Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000). Rosebud is the default destination, and subsequent commands use the saved project connection.
+Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Rosebud is the default destination, and subsequent commands use the saved project connection.
 
-JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` when it reports them, so you know which file to fix. Exit codes:
+JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` when it reports them, so you know which file to fix. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. Uploads are never sent again. Exit codes:
 
-| Exit | Meaning                                                                           |
-| ---- | --------------------------------------------------------------------------------- |
-| 0    | Command succeeded. Check `status` to see whether owner approval is still pending. |
-| 2    | Local input or usage error. Correct the command or build.                         |
-| 3    | HTTP rejection. Read its error code before retrying.                              |
-| 4    | The outcome is uncertain. Use the documented recovery path.                       |
+| Exit | Meaning                                                                                 |
+| ---- | --------------------------------------------------------------------------------------- |
+| 0    | Command succeeded. Check `status` or `whoami` to see whether approval is still pending. |
+| 2    | Local input or usage error. Correct the command or build.                               |
+| 3    | HTTP rejection. Read its error code before retrying.                                    |
+| 4    | The outcome is uncertain. Use the documented recovery path.                             |
 
 The CLI locks the state file during commands. If a process crashes, confirm it stopped before removing the neighboring `.lock` file. Run commands against one state file sequentially.
 

@@ -12,6 +12,8 @@ export class RosebudError extends Error {
   readonly status: number | undefined;
   /** The actual API error body, parsed as JSON when possible, otherwise text. */
   readonly body: JsonValue | undefined;
+  /** Seconds until a throttled request may be sent again, from Retry-After. */
+  readonly retryAfterSeconds: number | undefined;
 
   constructor(
     message: string,
@@ -21,6 +23,7 @@ export class RosebudError extends Error {
       outcome: PublishOutcome;
       status?: number;
       body?: JsonValue;
+      retryAfterSeconds?: number;
     },
   ) {
     super(message);
@@ -30,6 +33,7 @@ export class RosebudError extends Error {
     this.outcome = options.outcome;
     this.status = options.status;
     this.body = options.body;
+    this.retryAfterSeconds = options.retryAfterSeconds;
   }
 }
 

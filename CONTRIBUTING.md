@@ -17,7 +17,7 @@ The CLI publishes to `https://api.rosebud.ai` unless you override it. These over
 - `--api-base <origin>` on any command
 - the `ROSEBUD_API_BASE` environment variable
 
-Precedence is the flag, then a nonempty environment variable, then the origin saved with the project, then the default. The origin must be HTTPS; plain HTTP is accepted only for `localhost`, `127.0.0.1` and `[::1]`.
+Precedence is the flag, then a nonempty environment variable, then the origin saved with the project, then the default. Account and asset commands have no project, so they use the flag, then the environment variable, then the default; each origin keeps its own login. The origin must be HTTPS; plain HTTP is accepted only for `localhost`, `127.0.0.1` and `[::1]`.
 
 A saved project stays tied to the origin it was published to, and the CLI refuses to send it anywhere else. Use a separate `--state` file per environment, for example:
 
