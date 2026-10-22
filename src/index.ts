@@ -1,13 +1,22 @@
+import { openAsBlob } from "node:fs";
 import { link, mkdir, open, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { prepareBundle } from "./bundle.js";
+import { prepareRelease } from "./bundle.js";
+import type { MediaFile, PreparedRelease } from "./bundle.js";
 import { inputError, isObject, RosebudError } from "./errors.js";
 import type { JsonValue } from "./errors.js";
 
 export { RosebudError } from "./errors.js";
 export type { JsonValue, PublishOutcome, RosebudErrorKind } from "./errors.js";
+export {
+  prepareRelease,
+  FILE_BYTES,
+  GAME_FILES,
+  GAME_BYTES,
+} from "./bundle.js";
+export type { MediaFile, PreparedRelease } from "./bundle.js";
 
 export interface RosebudOptions {
   apiBaseUrl: string;
@@ -49,13 +58,33 @@ export interface GameMetadata {
 }
 export type BundleInput =
   { directory: string; zip?: never } | { zip: string; directory?: never };
-export type PublishOptions = BundleInput &
+export interface SignedUpload {
+  path: string;
+  url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+}
+export interface UploadSession {
+  upload_id: string;
+  upload_token: string;
+  expires_at: string;
+  /** Declared paths Rosebud already holds; nothing is uploaded for them. */
+  linked: string[];
+  uploads: SignedUpload[];
+}
+export type ReleaseInput = BundleInput &
   GameMetadata & {
-    context?: AdoptionContext;
-    /** A `rosebud login` token: the game goes straight into that account. */
-    token?: string;
+    /** From prepareRelease(); the build is not read again. */
+    prepared?: PreparedRelease;
+    /** Paths Rosebud holds as media (from a pull), sent as media whatever their type. */
+    knownMedia?: ReadonlySet<string>;
     signal?: AbortSignal;
   };
+export type PublishOptions = ReleaseInput & {
+  context?: AdoptionContext;
+  /** A `rosebud login` token: the game goes straight into that account. */
+  token?: string;
+};
 interface PublishedGame {
   project_id: string;
   play_url: string;
@@ -109,8 +138,7 @@ export interface ConnectionStatus {
   title?: string;
   play_url?: string;
 }
-export type UpdateOptions = BundleInput &
-  GameMetadata &
+export type UpdateOptions = ReleaseInput &
   AgentAuthorization & { expectedVersion: string; operationId: string };
 export interface UpdateResult {
   project_id: string;
@@ -349,11 +377,7 @@ export async function readCover(path: string): Promise<Uint8Array> {
     throw inputError("thumbnail", "The thumbnail file could not be read.");
   }
 }
-async function gameForm(
-  options: BundleInput & GameMetadata & { signal?: AbortSignal },
-): Promise<FormData> {
-  if (!options || typeof options !== "object")
-    throw inputError("input_required", "Provide a directory or ZIP path.");
+function checkMetadata(options: GameMetadata): void {
   for (const key of ["name", "title"] as const) {
     if (
       options[key] !== undefined &&
@@ -381,13 +405,15 @@ async function gameForm(
       "description",
       "Use a description of at most 4000 characters.",
     );
-  if (options.signal?.aborted)
-    throw inputError("aborted", "Upload cancelled before sending.");
-  const bytes = await prepareBundle(options);
+}
+async function metadataForm(
+  options: GameMetadata,
+  zip: Uint8Array,
+): Promise<FormData> {
   const form = new FormData();
   form.append(
     "bundle",
-    new Blob([new Uint8Array(bytes)], { type: "application/zip" }),
+    new Blob([new Uint8Array(zip)], { type: "application/zip" }),
     "game.zip",
   );
   for (const key of ["name", "title", "description"] as const)
@@ -399,6 +425,40 @@ async function gameForm(
       "cover",
     );
   return form;
+}
+
+// The only headers a signed upload may carry; the server's signature covers them.
+const signedHeaders = new Set([
+  "content-type",
+  "content-md5",
+  "x-goog-content-length-range",
+]);
+function localOrHttps(value: unknown): value is string {
+  if (!httpUrl(value)) return false;
+  const url = new URL(value as string);
+  return (
+    url.protocol === "https:" ||
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+  );
+}
+/** The whole game in one ZIP, for a Rosebud that takes no upload sessions. */
+async function oneZip(input: ReleaseInput): Promise<PreparedRelease> {
+  try {
+    return await prepareRelease(input, {
+      splitMedia: false,
+      ...(input.knownMedia ? { knownMedia: input.knownMedia } : {}),
+    });
+  } catch (error) {
+    if (
+      error instanceof RosebudError &&
+      ["compressed_limit", "size_limit", "entry_limit"].includes(error.code)
+    )
+      throw inputError(
+        error.code,
+        `${error.message} This Rosebud server doesn't take file-by-file uploads yet, so the whole game must fit in one 10 MiB ZIP.`,
+      );
+    throw error;
+  }
 }
 
 /** Node publishing client. Library calls never persist credentials or project files. */
@@ -444,10 +504,15 @@ export class Rosebud {
   }
 
   async publish(options: PublishOptions): Promise<PublishResult> {
-    const form = await gameForm(options);
+    // Checked first: the session request below already carries the token.
+    const token = options?.token;
+    if (token !== undefined) validateAccountToken(token);
+    const form = await this.releaseForm(
+      options,
+      token !== undefined ? { token } : {},
+    );
     if (options.context !== undefined)
       form.append("context", JSON.stringify(options.context));
-    if (options.token !== undefined) validateAccountToken(options.token);
     const body = await this.request(
       "/api/developer/projects/import/",
       "POST",
@@ -477,6 +542,72 @@ export class Rosebud {
     )
       unexpected();
     return body as unknown as PublishResult;
+  }
+
+  /** Declare media to Rosebud before the release; it answers with a signed upload per file it lacks. */
+  async createUploadSession(options: {
+    files: { path: string; size: number; md5: string }[];
+    /** With an agent token: a session for an update to this project. */
+    projectId?: string;
+    /** The agent token (with projectId), or an `rbk_` login (without). */
+    token?: string;
+    signal?: AbortSignal;
+  }): Promise<UploadSession> {
+    if (options.projectId !== undefined) {
+      projectPath(options.projectId);
+      validateToken(options.token ?? "");
+    } else if (options.token !== undefined) validateAccountToken(options.token);
+    const body = await this.request(
+      "/api/developer/uploads/",
+      "POST",
+      JSON.stringify({
+        files: options.files.map(({ path, size, md5 }) => ({
+          path,
+          size,
+          md5,
+        })),
+        ...(options.projectId !== undefined
+          ? { project_id: options.projectId.toLowerCase() }
+          : {}),
+      }),
+      options.token,
+      options.signal,
+    );
+    // Every declared path comes back exactly once, linked or with a signed PUT.
+    const declared = new Set(options.files.map((file) => file.path));
+    const seen = new Set<string>();
+    const claim = (path: unknown) => {
+      if (typeof path !== "string" || !declared.has(path) || seen.has(path))
+        unexpected();
+      seen.add(path);
+    };
+    if (
+      typeof body.upload_id !== "string" ||
+      !uuid.test(body.upload_id) ||
+      typeof body.upload_token !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(body.upload_token) ||
+      typeof body.expires_at !== "string" ||
+      !Array.isArray(body.linked) ||
+      !Array.isArray(body.uploads)
+    )
+      unexpected();
+    body.linked.forEach(claim);
+    for (const upload of body.uploads) {
+      if (
+        !isObject(upload) ||
+        upload.method !== "PUT" ||
+        !localOrHttps(upload.url) ||
+        !isObject(upload.headers) ||
+        !Object.entries(upload.headers).every(
+          ([name, value]) =>
+            signedHeaders.has(name.toLowerCase()) && typeof value === "string",
+        )
+      )
+        unexpected();
+      claim(upload.path);
+    }
+    if (seen.size !== declared.size) unexpected();
+    return body as unknown as UploadSession;
   }
 
   async connect(options: ConnectionOptions): Promise<ConnectionResult> {
@@ -538,7 +669,10 @@ export class Rosebud {
         "expected_version",
         "Use the content_version you last accepted for this project.",
       );
-    const form = await gameForm(options);
+    const form = await this.releaseForm(options, {
+      token: options.agentToken,
+      projectId: options.projectId,
+    });
     form.append("expected_version", options.expectedVersion);
     form.append("operation_id", options.operationId);
     const body = await this.request(
@@ -875,6 +1009,143 @@ export class Rosebud {
       await unlink(temporary).catch(() => undefined);
     }
     return size;
+  }
+
+  /** Declare the media and upload what Rosebud lacks; undefined when it takes no sessions. */
+  private async stage(
+    media: MediaFile[],
+    auth: { token?: string; projectId?: string },
+    signal?: AbortSignal,
+  ): Promise<UploadSession | undefined> {
+    let session: UploadSession;
+    try {
+      session = await this.createUploadSession({
+        files: media,
+        ...auth,
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      // An older Rosebud has no such route; project_unavailable is a real answer.
+      if (
+        error instanceof RosebudError &&
+        error.kind === "api" &&
+        ((error.status === 503 && error.code === "sync_unavailable") ||
+          (error.status === 404 && error.code !== "project_unavailable"))
+      )
+        return undefined;
+      throw error;
+    }
+    const files = new Map(media.map((file) => [file.path, file]));
+    const queue = [...session.uploads];
+    const stop = new AbortController();
+    const stopping = signal
+      ? AbortSignal.any([signal, stop.signal])
+      : stop.signal;
+    const worker = async () => {
+      for (let upload = queue.shift(); upload; upload = queue.shift()) {
+        const file = files.get(upload.path);
+        if (!file) unexpected();
+        try {
+          await this.put(upload, file, stopping);
+        } catch (error) {
+          // The first failure ends the others, so nothing is left running.
+          queue.length = 0;
+          stop.abort();
+          throw error;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(4, queue.length) }, worker),
+    );
+    return session;
+  }
+
+  /** One signed PUT. Repeating it replaces the bytes, so failures in transit are retried. */
+  private async put(
+    upload: SignedUpload,
+    file: MediaFile,
+    signal: AbortSignal,
+  ): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      let status: number | undefined;
+      try {
+        const body = await openAsBlob(file.absolute);
+        if (body.size !== file.size)
+          throw inputError(
+            "file_changed",
+            `${file.path} changed while uploading. Run the command again once the build has finished.`,
+          );
+        // Only the signed headers go: the API credential never reaches storage.
+        const response = await fetch(upload.url, {
+          method: "PUT",
+          body,
+          headers: upload.headers,
+          // A redirect would carry the bytes somewhere the signature didn't name.
+          redirect: "error",
+          signal: AbortSignal.any([
+            AbortSignal.timeout(this.timeoutMs),
+            signal,
+          ]),
+        });
+        await response.body?.cancel();
+        if (response.ok) return;
+        status = response.status;
+      } catch (error) {
+        if (error instanceof RosebudError) throw error;
+        if (signal.aborted)
+          throw new RosebudError("Upload cancelled. Nothing was released.", {
+            kind: "transport",
+            code: "aborted",
+            outcome: "not_sent",
+          });
+      }
+      if (
+        status !== undefined &&
+        status < 500 &&
+        status !== 408 &&
+        status !== 429
+      )
+        throw new RosebudError(
+          `Storage refused ${file.path} (HTTP ${status}): it changed after it was read, or its upload link expired. Run the command again; nothing was released.`,
+          { kind: "api", code: "upload_rejected", outcome: "rejected", status },
+        );
+      if (attempt === 3)
+        throw new RosebudError(
+          `Could not upload ${file.path}. Run the command again; nothing was released, and files Rosebud already has are not sent twice.`,
+          { kind: "transport", code: "upload_failed", outcome: "not_sent" },
+        );
+      await sleep(attempt * 1000, undefined, { signal }).catch(() => undefined);
+    }
+  }
+
+  /** The release form; media goes first through an upload session when Rosebud takes one. */
+  private async releaseForm(
+    options: ReleaseInput,
+    auth: { token?: string; projectId?: string },
+  ): Promise<FormData> {
+    if (!options || typeof options !== "object")
+      throw inputError("input_required", "Provide a directory or ZIP path.");
+    checkMetadata(options);
+    if (options.signal?.aborted)
+      throw inputError("aborted", "Upload cancelled before sending.");
+    let release =
+      options.prepared ??
+      (await prepareRelease(options, {
+        splitMedia: true,
+        ...(options.knownMedia ? { knownMedia: options.knownMedia } : {}),
+      }));
+    let session: UploadSession | undefined;
+    if (release.media.length) {
+      session = await this.stage(release.media, auth, options.signal);
+      if (!session) release = await oneZip(options);
+    }
+    const form = await metadataForm(options, release.zip);
+    if (session) {
+      form.append("upload_id", session.upload_id);
+      form.append("upload_token", session.upload_token);
+    }
+    return form;
   }
 
   private async request(

@@ -89,6 +89,11 @@ async function rosebud(t) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const path = new URL(req.url, "http://fake").pathname;
+    // No upload sessions here: games with media go as one ZIP, as in 0.1.0.
+    if (path === "/api/developer/uploads/") {
+      json(res, { error: { code: "sync_unavailable", message: "off" } }, 503);
+      return;
+    }
     if (path === "/api/developer/projects/import/") {
       api.publishes.push(req.headers.authorization);
       if (api.login === "pending") {

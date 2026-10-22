@@ -46,6 +46,13 @@ async function api(t, handler) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const bytes = Buffer.concat(chunks);
+    // No upload sessions here: games with media go as one ZIP, as in 0.1.0.
+    if (req.url === "/api/developer/uploads/")
+      return json(
+        res,
+        { error: { code: "sync_unavailable", message: "off" } },
+        503,
+      );
     requests.push({
       method: req.method,
       url: req.url,
