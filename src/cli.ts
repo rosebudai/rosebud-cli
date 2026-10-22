@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { prepareRelease } from "./bundle.js";
 import type { PreparedRelease } from "./bundle.js";
 import {
+  GAME_FILES,
   Rosebud,
   RosebudError,
   publishedToAccount,
@@ -153,7 +154,10 @@ const assetCommands: Record<string, number> = {
   list: 2,
   download: 3,
 };
-/** What Rosebud now holds, and the folder it came from, so a later pull there can tell local edits from Rosebud's. */
+/**
+ * What Rosebud now holds, and the folder it came from, so a later pull into that
+ * folder can tell local edits from Rosebud's.
+ */
 function remember(
   handle: ProjectHandle,
   release: PreparedRelease,
@@ -196,11 +200,13 @@ function pullAdvice(options: {
   state: string | undefined;
   conflicts: PullPlan["conflicts"];
   missing: string[];
+  hidden: string[];
   skipped: { path: string; reason: SkipReason }[];
   remoteCopies: string;
   version: string;
 }): string {
-  const { directory, state, conflicts, missing, skipped, version } = options;
+  const { directory, state, conflicts, missing, hidden, skipped, version } =
+    options;
   const flags = gameFlags(directory, state);
   const has = (reason: PullPlan["conflicts"][number]["reason"]) =>
     conflicts.some((c) => c.reason === reason);
@@ -220,6 +226,15 @@ function pullAdvice(options: {
   if (skipped.some((s) => s.reason === "unsafe_path"))
     notes.push(
       "Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first.",
+    );
+  if (hidden.length > 0)
+    notes.push(
+      `Update refuses hidden files and folders, and ${directory} holds ${hidden
+        .slice(0, 3)
+        .map(quoted)
+        .join(
+          ", ",
+        )}${hidden.length > 3 ? ", …" : ""}: move them out, or update from a folder without them.`,
     );
   if (skipped.some((s) => s.reason === "duplicate_path"))
     notes.push(
@@ -341,7 +356,8 @@ async function main(): Promise<void> {
     return;
   }
   const command = positionals[0] ?? "";
-  invocation.command = command;
+  invocation.command =
+    command === "assets" ? `assets ${positionals[1] ?? ""}` : command;
   invocation.directory = value("directory");
   invocation.state = value("state");
   const client = value("agent-client") ?? "unknown";
@@ -664,6 +680,7 @@ async function main(): Promise<void> {
           state: value("state"),
           conflicts,
           missing: pulled.plan.missing,
+          hidden: pulled.hidden,
           skipped: pulled.skipped,
           remoteCopies,
           version: game.content_version,
@@ -1003,7 +1020,7 @@ async function assets(
     // An expired login keeps Rosebud's own message, which says what to do.
     if (unknownToken(error) && (error as RosebudError).code !== "key_expired")
       throw new RosebudError(
-        "Rosebud did not accept the saved login. Run rosebud whoami: a pending login still needs the person to approve its approval_url, and after revoked or expired, run rosebud login again.",
+        `Rosebud did not accept the saved login. Run rosebud whoami: a pending login still needs the person to approve its approval_url, and after revoked or expired, run rosebud login again.${creating ? " Then rerun the identical create; it resumes the saved request without paying again." : ""}`,
         {
           kind: "api",
           code: (error as RosebudError).code,
@@ -1300,7 +1317,7 @@ function requiredScope(body: JsonValue | undefined): string | undefined {
   const scope = isObject(body.error)
     ? body.error.required_scope
     : body.required_scope;
-  return typeof scope === "string" && /^[a-z]+:[a-z]+$/.test(scope)
+  return typeof scope === "string" && /^[a-z]{1,32}:[a-z]{1,32}$/.test(scope)
     ? scope
     : undefined;
 }
@@ -1339,11 +1356,14 @@ function byteLimit(value: JsonValue | undefined): number | undefined {
     ? Number(value)
     : undefined;
 }
-/** The files an update conflict names: null when Rosebud can't tell, else a bounded list. */
+/**
+ * The files an update conflict names: null when Rosebud can't tell, else a bounded
+ * list. Rosebud names the paths before and after, so a rewritten game lists each twice.
+ */
 function pathList(value: JsonValue | undefined): string[] | null | undefined {
   if (value === null) return null;
   return Array.isArray(value) &&
-    value.length <= 2000 &&
+    value.length <= 2 * GAME_FILES &&
     value.every((path) => typeof path === "string" && path.length <= 500)
     ? (value as string[])
     : undefined;
@@ -1358,6 +1378,11 @@ function nextAction(
   details: ApiDetails,
 ): string | undefined {
   const { command, directory, state } = invocation;
+  // Whether or not its request was kept, rerunning a create can't pay twice.
+  const rerunCreate =
+    command === "assets create"
+      ? ". After they approve, rerun the identical `rosebud assets create` command; it resumes the saved request without paying again."
+      : ".";
   switch (error.code) {
     case "busy": {
       const seconds = error.retryAfterSeconds;
@@ -1385,8 +1410,13 @@ function nextAction(
     }
     case "plan_required":
       return "Publishing and updating still work. Reading files back needs the game owner's plan to include code download, so ask the person what they changed in Rosebud before you update, to avoid replacing their edits.";
-    case "release_upload_limit":
-      return `This update adds more new media than Rosebud takes at once${details.limit === undefined ? "" : ` (limit: ${details.limit} bytes)`}. Update with part of the new media first, then again with the rest; files Rosebud already has are not uploaded again.`;
+    case "release_upload_limit": {
+      const limit =
+        details.limit === undefined ? "" : ` (limit: ${details.limit} bytes)`;
+      return command === "publish"
+        ? `This publish adds more new media than Rosebud takes at once${limit}. Publish with part of the media first, then update with the rest; files Rosebud already has are not uploaded again.`
+        : `This update adds more new media than Rosebud takes at once${limit}. Update with part of the new media first, then again with the rest; files Rosebud already has are not uploaded again.`;
+    }
     case "upload_stale":
     case "upload_expired":
     case "invalid_upload":
@@ -1394,9 +1424,9 @@ function nextAction(
     case "sync_unavailable":
       return "This Rosebud server can't read files back or take file-by-file uploads yet.";
     case "key_expired":
-      return "This login expired after 90 days without use. Run `rosebud login` and give the new approval_url to the person.";
+      return `This login expired after 90 days without use. Run \`rosebud login\` and give the new approval_url to the person${rerunCreate}`;
     case "insufficient_scope":
-      return `This login wasn't granted ${details.required_scope === undefined ? "that permission" : quoted(details.required_scope)}. Run \`rosebud logout\`, then \`rosebud login\`, and give the new approval_url to the person.`;
+      return `This login wasn't granted ${details.required_scope === undefined ? "that permission" : quoted(details.required_scope)}. Run \`rosebud logout\`, then \`rosebud login\`, and give the new approval_url to the person${rerunCreate}`;
     default:
       return undefined;
   }

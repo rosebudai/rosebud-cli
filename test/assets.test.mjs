@@ -690,6 +690,52 @@ test("a login without a needed scope names it and says to log in again", async (
   );
 });
 
+test("assets create refused for an expired or under-scoped login says to rerun the identical command after logging in", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const create = [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+    "--out",
+    "moss.zip",
+  ];
+  for (const refuse of [
+    {
+      status: 401,
+      code: "key_expired",
+      message: "This login expired after 90 days without use.",
+    },
+    {
+      status: 403,
+      code: "insufficient_scope",
+      message: "This key lacks the assets:write scope.",
+      scope: "assets:write",
+    },
+  ]) {
+    api.refuse = refuse;
+    const failed = await cli(root, api, create);
+    assert.equal(failed.code, 3);
+    assert.equal(failed.error.code, refuse.code);
+    assert.match(
+      failed.error.next_action,
+      /approval_url to the person\. After they approve, rerun the identical `rosebud assets create` command; it resumes the saved request without paying again\.$/,
+    );
+  }
+  // Other commands are not told to rerun a create.
+  const quoted = await cli(root, api, [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ]);
+  assert.doesNotMatch(quoted.error.next_action, /assets create/);
+});
+
 test("a scope name that Rosebud does not send in the expected form is never repeated", async (t) => {
   const { root, api } = await loggedIn(t);
   const quote = [
@@ -709,9 +755,22 @@ test("a scope name that Rosebud does not send in the expected form is never repe
   const odd = await cli(root, api, quote);
   assert.equal(odd.code, 3);
   assert.equal(odd.error.required_scope, undefined);
-  assert.doesNotMatch(odd.error.next_action, /echo/);
+  assert.doesNotMatch(odd.stderr, /echo hi/);
   assert.match(odd.error.next_action, /that permission/);
   assert.match(odd.error.next_action, /`rosebud logout`, then `rosebud login`/);
+  // The publishing endpoints' shape, {error: {code, required_scope}}, is checked the same way.
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "insufficient_scope");
+  assert.equal(published.error.required_scope, undefined);
+  assert.doesNotMatch(published.stderr, /echo hi/);
+  assert.match(published.error.next_action, /that permission/);
+  // A scope of the right form but an unreasonable length is dropped too.
+  api.refuse = { ...api.refuse, scope: `${"a".repeat(33)}:write` };
+  const long = await cli(root, api, quote);
+  assert.equal(long.error.required_scope, undefined);
+  assert.match(long.error.next_action, /that permission/);
 
   api.refuse = { ...api.refuse, scope: undefined };
   const bare = await cli(root, api, quote);

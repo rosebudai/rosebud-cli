@@ -13,10 +13,13 @@
 - Text files may have any name the Rosebud editor allows, such as Markdown notes, except hidden names, names of only spaces and names with `< > : " | ? * / \` or control characters. Names ending in `.env` are excluded as credentials, in any case and ignoring surrounding spaces.
 - OS junk (`.DS_Store`, `Thumbs.db`, `desktop.ini`) is skipped when packing and pulling, never uploaded and never an error. Other hidden files are still refused.
 - `.svg` and `.gltf` files outside `assets/` are text. A path Rosebud holds as text, such as an `assets/icon.svg` that Rosie wrote, stays text when you update; media Rosebud already holds stays media.
-- Update conflicts list the files that changed (`changed_paths`), and errors suggest a `next_action`.
+- Update conflicts list the files that changed (`changed_paths`, up to 4,000 paths), and errors suggest a `next_action`.
 - A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; run the same command again, or change your files first unless an earlier update is still uncertain. While `assets create` waits for a job, busy answers are waited out. Upload sessions are asked for again automatically while Rosebud checks a game's existing files, for as long as its `remaining` count keeps falling.
 - A command stopped with Ctrl+C or SIGTERM releases its state lock and exits 130 or 143 with the error code `interrupted`, and a lock left by a process that no longer runs is taken over, so a rerun after an agent's timeout isn't refused.
-- Logins carry scopes and expire after 90 days without use. `rosebud whoami` shows `scopes` and `expires_at`. An expired login fails with `key_expired`, and a login without a needed permission fails with `insufficient_scope` and its `required_scope`; both carry a `next_action`.
+- A Rosebud server without file sync (HTTP 503 `sync_unavailable`) is reported as a rejection (exit 3), and a failure while asking for an upload session says nothing was released.
+- Signed uploads send whatever headers Rosebud's session lists, except credentials and connection headers, so storage can add signed headers without breaking uploads.
+- On Windows, `rosebud pull` skips names Windows can't keep (a trailing dot or space, or device names such as `con.js`) as `unsafe_path`, and pull warns about hidden files in the folder, which `update` refuses.
+- Logins carry scopes and expire after 90 days without use. `rosebud whoami` shows `scopes` and `expires_at`. An expired login fails with `key_expired`, and a login without a needed permission fails with `insufficient_scope` and its `required_scope`; both carry a `next_action`, which for `assets create` says to rerun the identical command once the person approves the new login.
 
 ## 0.1.0
 

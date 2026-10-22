@@ -332,8 +332,10 @@ function apiError(
       : { message: result.detail, code: result.code }
     : undefined;
   const code = typeof detail?.code === "string" ? detail.code : "http_error";
-  // Backpressure refuses the request before anything runs, so unlike other 5xx
-  // answers its outcome is known: not applied.
+  // Backpressure, and a server without file sync, refuse the request before
+  // anything runs, so unlike other 5xx answers their outcome is known: not applied.
+  const refused =
+    status === 503 && (code === "busy" || code === "sync_unavailable");
   const busy = status === 503 && code === "busy";
   const waits =
     status === 429 || busy || (status === 409 && code === "upload_retry");
@@ -344,7 +346,8 @@ function apiError(
     {
       kind: "api",
       code,
-      outcome: (status >= 400 && status < 500) || busy ? "rejected" : "unknown",
+      outcome:
+        (status >= 400 && status < 500) || refused ? "rejected" : "unknown",
       status,
       body: result,
       ...(waits && retryAfter && /^\d{1,9}$/.test(retryAfter)
@@ -386,6 +389,33 @@ function downloadInterrupted(signal: AbortSignal): RosebudError {
 }
 const downloadLimit = 512 * 1024 * 1024;
 const filesLimit = 256 * 1024 * 1024;
+/**
+ * A failure before the release request: whatever happened to the upload session
+ * or its uploads, nothing was released. An answer from Rosebud refused the step;
+ * a lost or garbled one means it was never sent.
+ */
+function notReleased(error: unknown): unknown {
+  if (!(error instanceof RosebudError) || error.outcome !== "unknown")
+    return error;
+  const api = error.kind === "api";
+  return new RosebudError(
+    api
+      ? `${error.message.replace(/([^.!?])$/, "$1.")} Nothing was released; run the command again.`
+      : error.kind === "transport"
+        ? "The request for an upload session was interrupted. Nothing was released; run the command again."
+        : "Rosebud's answer to the request for an upload session was unexpected. Nothing was released; run the command again.",
+    {
+      kind: error.kind,
+      code: error.code,
+      outcome: api ? "rejected" : "not_sent",
+      ...(error.status !== undefined ? { status: error.status } : {}),
+      ...(error.body !== undefined ? { body: error.body } : {}),
+      ...(error.retryAfterSeconds !== undefined
+        ? { retryAfterSeconds: error.retryAfterSeconds }
+        : {}),
+    },
+  );
+}
 function unexpected(): never {
   throw new RosebudError(
     "The API returned an unexpected response. The operation may have completed; no retry was attempted.",
@@ -472,12 +502,36 @@ function metadataForm(
   return form;
 }
 
-// The only headers a signed upload may carry; the server's signature covers them.
-const signedHeaders = new Set([
-  "content-type",
-  "content-md5",
-  "x-goog-content-length-range",
+/**
+ * Headers a signed upload may never carry: credentials, and ones that belong to
+ * the connection rather than the request. Any other header the session returns
+ * goes as it is, so storage can add signed headers without breaking uploads.
+ */
+const refusedHeaders = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "upgrade",
+  "expect",
 ]);
+/** An HTTP header name (RFC 9110 token) and a value without line breaks. */
+function signedHeader([name, value]: [string, JsonValue]): boolean {
+  return (
+    /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/.test(name) &&
+    !refusedHeaders.has(name.toLowerCase()) &&
+    typeof value === "string" &&
+    value.length <= 8192 &&
+    !/[\r\n\0]/.test(value)
+  );
+}
 function localOrHttps(value: unknown): value is string {
   if (!httpUrl(value)) return false;
   const url = new URL(value as string);
@@ -522,7 +576,7 @@ export class Rosebud {
     } catch {
       throw inputError(
         "api_base",
-        "Provide an explicit HTTP(S) API origin in apiBaseUrl.",
+        "Use an HTTP(S) API origin with --api-base, such as https://api.rosebud.ai.",
       );
     }
     if (!httpUrl(url.href) || url.pathname !== "/" || url.search || url.hash)
@@ -548,7 +602,7 @@ export class Rosebud {
     )
       throw inputError(
         "timeout",
-        "timeoutMs must be a positive integer at most 2147483647.",
+        "Use --timeout-ms with a whole number of milliseconds, from 1 to 2147483647.",
       );
   }
 
@@ -677,10 +731,7 @@ export class Rosebud {
         upload.method !== "PUT" ||
         !localOrHttps(upload.url) ||
         !isObject(upload.headers) ||
-        !Object.entries(upload.headers).every(
-          ([name, value]) =>
-            signedHeaders.has(name.toLowerCase()) && typeof value === "string",
-        )
+        !Object.entries(upload.headers).every(signedHeader)
       )
         unexpected();
       claim(upload.path);
@@ -1238,7 +1289,7 @@ export class Rosebud {
         );
       if (attempt === 3)
         throw new RosebudError(
-          `Could not upload ${file.path}. Run the command again; nothing was released. On a slow connection, allow more time with --timeout-ms (timeoutMs in the library).`,
+          `Could not upload ${file.path}. Run the command again; nothing was released. On a slow connection, allow more time with --timeout-ms.`,
           { kind: "transport", code: "upload_failed", outcome: "not_sent" },
         );
       await sleep(attempt * 1000, undefined, { signal }).catch(() => undefined);
@@ -1269,7 +1320,11 @@ export class Rosebud {
       }));
     let session: UploadSession | undefined;
     if (release.media.length) {
-      session = await this.stage(release.media, auth, options.signal);
+      try {
+        session = await this.stage(release.media, auth, options.signal);
+      } catch (error) {
+        throw notReleased(error);
+      }
       if (!session) release = await oneZip(options);
     }
     const form = metadataForm(options, release.zip, cover);

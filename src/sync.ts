@@ -253,8 +253,17 @@ export function planPull(
   return plan;
 }
 
-/** A relative path that stays inside the folder on every platform. */
-export function safePath(path: string): boolean {
+/** Names Windows reserves for devices, with any extension, and names it would trim. */
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+/**
+ * A relative path that stays inside the folder on every platform, and that this
+ * platform saves under the same name: Windows drops a trailing dot or space, and
+ * writes names such as `con.js` to a device.
+ */
+export function safePath(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
   return (
     path.length > 0 &&
     path.length <= 500 &&
@@ -266,7 +275,9 @@ export function safePath(path: string): boolean {
           part !== ".." &&
           !part.startsWith(".") &&
           part.length <= 255 &&
-          !UNSAFE.test(part),
+          !UNSAFE.test(part) &&
+          (platform !== "win32" ||
+            (!/[. ]$/.test(part) && !WINDOWS_DEVICE.test(part))),
       )
   );
 }
@@ -302,15 +313,24 @@ const linkRefused = (path: string) =>
  * since the folder then ignores it, the next update leaves it out of the game.
  * Update skips junk the same way and refuses other hidden entries with unsafe_path.
  */
-async function localFiles(
-  root: string,
-): Promise<{ files: Map<string, string>; folders: string[] }> {
+async function localFiles(root: string): Promise<{
+  files: Map<string, string>;
+  folders: string[];
+  /** Hidden entries other than OS junk, which update would refuse. */
+  hidden: string[];
+}> {
   const found = new Map<string, string>();
   const folders: string[] = [];
+  const hidden: string[] = [];
   async function walk(path: string): Promise<void> {
     for (const name of (await readdir(join(root, path))).sort()) {
-      if (name.startsWith(".") || LEFTOVER.test(name)) continue;
       const child = path ? `${path}/${name}` : name;
+      if (name.startsWith(".")) {
+        if (!(isOsJunk(name) && (await lstat(join(root, child))).isFile()))
+          hidden.push(child);
+        continue;
+      }
+      if (LEFTOVER.test(name)) continue;
       const info = await lstat(join(root, child));
       if (isOsJunk(name) && info.isFile()) continue;
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
@@ -339,7 +359,7 @@ async function localFiles(
     await mkdir(root, { recursive: true }); // a new folder is fine
   }
   await walk("");
-  return { files: found, folders };
+  return { files: found, folders, hidden };
 }
 
 /**
@@ -493,6 +513,8 @@ export async function pullInto(options: {
   media: string[];
   /** Conflicting path → Rosebud's copy on disk. */
   copies: Record<string, string>;
+  /** Hidden entries in the folder, other than OS junk: update refuses them. */
+  hidden: string[];
 }> {
   const { api, game, directory, remoteCopies } = options;
   const inside = relative(remoteCopies, directory);
@@ -532,7 +554,7 @@ export async function pullInto(options: {
     media.set(file.path, file);
     if (file.md5 !== null) remote.set(file.path, file.md5);
   }
-  const { files: local, folders } = await localFiles(directory);
+  const { files: local, folders, hidden } = await localFiles(directory);
   await rm(remoteCopies, { recursive: true, force: true });
   const incoming = join(remoteCopies, ".incoming");
   /** Downloaded and checked, outside the folder; fetched once, whatever it is needed for. */
@@ -620,6 +642,7 @@ export async function pullInto(options: {
       files: Object.fromEntries(files),
       media: [...media.keys()].sort(),
       copies,
+      hidden,
     };
   } finally {
     await rm(incoming, { recursive: true, force: true });

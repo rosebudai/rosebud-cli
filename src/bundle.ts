@@ -83,7 +83,7 @@ function checkName(name: string, path: string): void {
   if (UNSAFE_NAME.test(name) || name.length > 255 || path.length > 500)
     throw inputError(
       "unsafe_path",
-      `Rename ${path}: names can't contain < > : " | ? * or control characters, and paths are at most 500 characters.`,
+      `Rename ${path}: names can't contain < > : " | ? * or control characters, names are at most 255 characters and paths at most 500.`,
     );
 }
 
@@ -107,7 +107,7 @@ function checkText(content: Uint8Array, path: string): void {
   if (text.includes("\u0000"))
     throw inputError(
       "unsupported_file",
-      `${path} is not UTF-8 text. Put binary media under assets/ with a media extension: PNG, JPEG, WebP, SVG, WAV, MP3, OGG, WOFF/WOFF2, TTF/OTF, WASM, GLB/glTF or BIN.`,
+      `${path} is not UTF-8 text. Put binary media under assets/ with a media extension: PNG, JPEG, WebP, SVG, WAV, MP3, OGG/OGA, WOFF/WOFF2, TTF/OTF, WASM, GLB/glTF or BIN.`,
     );
 }
 

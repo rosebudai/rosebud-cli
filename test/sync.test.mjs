@@ -177,6 +177,14 @@ test("a session that asks for another header or an insecure URL is refused befor
   const storage = await rogueServer(t, (_req, res) => res.writeHead(200).end());
   for (const [url, headers] of [
     [`${storage.base}/put`, { Authorization: "Bearer stolen" }],
+    [`${storage.base}/put`, { Cookie: "session=stolen" }],
+    [`${storage.base}/put`, { "Proxy-Authorization": "Basic x" }],
+    [`${storage.base}/put`, { Host: "elsewhere.example" }],
+    [`${storage.base}/put`, { Connection: "close" }],
+    [`${storage.base}/put`, { "Content-Length": "1" }],
+    [`${storage.base}/put`, { "Transfer-Encoding": "chunked" }],
+    [`${storage.base}/put`, { "Bad Name": "x" }],
+    [`${storage.base}/put`, { "x-goog-meta": "a\r\nInjected: 1" }],
     [
       "http://storage.example.invalid/put",
       { "Content-Type": "application/octet-stream" },
@@ -200,6 +208,59 @@ test("a session that asks for another header or an insecure URL is refused befor
     assert.deepEqual(api.requests, ["POST /api/developer/uploads/"]);
   }
   assert.deepEqual(storage.requests, []);
+});
+
+test("a signed upload may carry headers the CLI doesn't know, and sends them", async (t) => {
+  const game = await fakeRosebud(t, {
+    putHeaders: { "x-goog-if-generation-match": "0" },
+  });
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+  assert.deepEqual(game.puts, ["assets/hero.png"]);
+  const put = game.requests.find((r) => r.method === "PUT");
+  assert.equal(put.headers["x-goog-if-generation-match"], "0");
+  assert.equal(put.headers.authorization, undefined);
+});
+
+test("a failure while asking for an upload session released nothing, and says so", async (t) => {
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  for (const respond of [
+    // An answer of the wrong shape.
+    (_req, res) =>
+      res
+        .writeHead(201, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ upload_id: "nope" })),
+    // A connection that drops.
+    (req) => req.socket.destroy(),
+  ]) {
+    const api = await rogueServer(t, respond);
+    await assert.rejects(
+      new Rosebud({ apiBaseUrl: api.base }).publish({ directory: root }),
+      (e) =>
+        e.outcome === "not_sent" &&
+        /Nothing was released/.test(e.message) &&
+        !/may have completed/.test(e.message),
+    );
+    assert.deepEqual(api.requests, ["POST /api/developer/uploads/"]);
+  }
+  // A server error is a refusal: nothing released, so an update starts afresh.
+  const game = await fakeRosebud(t);
+  const project = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  await writeFile(
+    join(project, "dist/assets/hero.png"),
+    Buffer.concat([png, png]),
+  );
+  game.inject.push({ path: "/uploads/", status: 500, error: { code: "oops" } });
+  const failed = await run(project, ["update", "--directory", "dist"]);
+  assert.equal(failed.code, 3);
+  assert.equal(failed.error.outcome, "rejected");
+  assert.doesNotMatch(failed.error.message, /may have completed/);
+  await writeFile(join(project, "dist/index.html"), "two");
+  const changed = await run(project, ["update", "--directory", "dist"]);
+  assert.equal(changed.code, 0, JSON.stringify(changed.error));
 });
 
 test("project_unavailable from the session is the answer, not a reason to send one ZIP", async (t) => {
@@ -278,6 +339,7 @@ test("giving up on a PUT says how to allow more time", async (t) => {
       e.outcome === "not_sent" &&
       e.message.includes("assets/hero.png") &&
       e.message.includes("--timeout-ms") &&
+      !/library|timeoutMs/.test(e.message) &&
       !/twice/.test(e.message),
   );
   assert.equal(game.releases, 0);
@@ -784,6 +846,25 @@ test("planPull matches names the way the disk does, and refuses Rosebud names th
     ["scripts/a.js", "case_conflict", "Scripts"],
   ]);
   assert.deepEqual([moved.write, moved.remove], [[], []]);
+});
+
+test("safePath refuses names Windows would change or treat as devices, there only", () => {
+  for (const name of [
+    "foo.js.",
+    "foo.js ",
+    "levels /one.json",
+    "con",
+    "CON.js",
+    "nul.txt",
+    "assets/aux.png",
+    "com1.json",
+    "LPT9",
+  ]) {
+    assert.equal(safePath(name, "win32"), false, name);
+    assert.equal(safePath(name, "linux"), true, name);
+  }
+  for (const name of ["console.js", "con-1.js", "com10.js", "a.b.c"])
+    assert.equal(safePath(name, "win32"), true, name);
 });
 
 test("safePath keeps every write inside the folder", () => {
@@ -1551,16 +1632,69 @@ test("refusals say what to do next, never mention pricing, and give limits as nu
   // An unrelated refusal gets no advice.
   const plain = await refused(400, { code: "invalid_media" });
   assert.equal(plain.error.next_action, undefined);
-  // A Rosebud without the file API is an uncertain outcome, still with advice.
+  // A Rosebud without the file API refused the request, and says so.
   game.sync = false;
   const old = await run(root, ["pull", "--directory", "dist"]);
   assert.equal(old.error.code, "sync_unavailable");
+  assert.equal(old.error.outcome, "rejected");
+  assert.equal(old.code, 3);
   assert.equal(
     old.error.next_action,
     "This Rosebud server can't read files back or take file-by-file uploads yet.",
   );
   for (const result of [tooMuch, numeric, old])
     assert.doesNotMatch(result.error.next_action, /\$|price|pricing|upgrade/i);
+});
+
+test("a first publish over the new-media limit is told to publish part of it, then update with the rest", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await folder(t, {
+    "dist/index.html": "x",
+    "dist/assets/hero.png": png,
+  });
+  game.inject.push({
+    path: "/uploads/",
+    status: 400,
+    error: { code: "release_upload_limit", limit: 134217728 },
+  });
+  const refused = await run(root, [
+    "publish",
+    "--directory",
+    "dist",
+    "--api-base",
+    game.base,
+  ]);
+  assert.equal(refused.code, 3);
+  assert.equal(refused.error.limit, 134217728);
+  assert.equal(
+    refused.error.next_action,
+    "This publish adds more new media than Rosebud takes at once (limit: 134217728 bytes). Publish with part of the media first, then update with the rest; files Rosebud already has are not uploaded again.",
+  );
+});
+
+test("a conflict lists every changed path Rosebud names, up to two per game file", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  const paths = (count) =>
+    Array.from(
+      { length: count },
+      (_, i) => `f${String(i).padStart(4, "0")}.js`,
+    );
+  game.inject.push({
+    path: "/releases/",
+    status: 409,
+    error: { code: "version_conflict", changed_paths: paths(4000) },
+  });
+  const most = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(most.error.changed_paths.length, 4000);
+  assert.match(most.error.next_action, /^Rosebud changed 4000 file\(s\)/);
+  game.inject.push({
+    path: "/releases/",
+    status: 409,
+    error: { code: "version_conflict", changed_paths: paths(4001) },
+  });
+  const over = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(over.error.changed_paths, undefined);
 });
 
 /** The saved pending operation's id, from the credential files under root. */
@@ -2004,6 +2138,13 @@ test("the folder's own leftovers are not game files: hidden entries and old .par
   const pull = await run(root, ["pull", "--directory", "dist"]);
   assert.equal(pull.code, 0, JSON.stringify(pull.error));
   assert.deepEqual(pull.data.local_only, ["mine.js"]);
+  // Update refuses hidden entries other than OS junk, so pull says so now.
+  assert.match(pull.data.next_action, /hidden/);
+  assert.match(pull.data.next_action, /`\.git`/);
+  assert.doesNotMatch(pull.data.next_action, /DS_Store/);
+  await rm(join(root, "dist/.git"), { recursive: true });
+  const clean = await run(root, ["pull", "--directory", "dist"]);
+  assert.doesNotMatch(clean.data.next_action, /hidden/);
 });
 
 test("OS junk files are not game files: pull ignores them and update does not upload or refuse them", async (t) => {

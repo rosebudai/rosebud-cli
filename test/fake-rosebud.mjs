@@ -51,6 +51,7 @@ export async function fakeRosebud(t, options = {}) {
     uploadRemaining: [...(options.uploadRemaining ?? [])],
     // Text names are stored in NFC, as Rosebud's file rules say, whatever form was uploaded.
     nfc: options.nfc ?? false,
+    putHeaders: options.putHeaders ?? {}, // more headers each signed upload must carry
     // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
     // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
     inject: [],
@@ -203,6 +204,7 @@ export async function fakeRosebud(t, options = {}) {
                 "Content-Type": "application/octet-stream",
                 "Content-MD5": Buffer.from(file.md5, "hex").toString("base64"),
                 "x-goog-content-length-range": `${file.size},${file.size}`,
+                ...game.putHeaders,
               },
             });
         });
@@ -229,6 +231,9 @@ export async function fakeRosebud(t, options = {}) {
           return reply(res, 503, undefined);
         }
         if (
+          Object.entries(game.putHeaders).some(
+            ([name, value]) => req.headers[name.toLowerCase()] !== value,
+          ) ||
           req.headers["content-md5"] !==
             Buffer.from(md5(bytes), "hex").toString("base64") ||
           req.headers["x-goog-content-length-range"] !==
