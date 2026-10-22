@@ -423,6 +423,8 @@ async function protectCaseRenames(
     if (
       rival !== undefined &&
       rival !== target &&
+      // A file of this very name is the target itself, as when the disk keeps Foo.js and foo.js apart.
+      !local.has(target) &&
       (await lstat(join(directory, ...target.split("/"))).then(
         () => true,
         () => false,

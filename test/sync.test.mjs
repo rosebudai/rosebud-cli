@@ -731,8 +731,8 @@ test("planPull matches names the way the disk does, and refuses Rosebud names th
   const m = (o) => new Map(Object.entries(o));
   // A disk like macOS's: letter case and Unicode form don't tell names apart.
   const fold = (path) => path.normalize("NFC").toLowerCase();
-  const nfd = "café.js",
-    nfc = "café.js";
+  const nfd = "cafe\u0301.js",
+    nfc = "caf\u00e9.js";
   const game = m({
     "index.html": "i",
     "Foo.js": "U",
@@ -2432,6 +2432,34 @@ test("on a case-sensitive disk, names that differ only in case are different fil
   assert.deepEqual(pull.data.written, ["foo.js"]);
   assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
   assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
+});
+
+test("on a case-sensitive disk, Foo.js and foo.js are two files, and Rosebud's change to either is written", async (t) => {
+  if (await caseInsensitiveDisk(t))
+    return t.skip("this file system is case-insensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "i",
+    "Foo.js": "U1",
+    "foo.js": "l1",
+  });
+  game.edit({ text: { "Foo.js": "U2" } });
+  const upper = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(upper.code, 0, JSON.stringify(upper.error));
+  assert.deepEqual(
+    [upper.data.status, upper.data.written, upper.data.conflicts],
+    ["synced", ["Foo.js"], []],
+  );
+  assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "U2");
+  assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "l1");
+  game.edit({ text: { "foo.js": "l2" } });
+  const lower = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.deepEqual(
+    [lower.data.written, lower.data.conflicts],
+    [["foo.js"], []],
+  );
+  assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "U2");
+  assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "l2");
 });
 
 test("Rosebud names that this disk would store as one file are all refused, with each copy kept apart", async (t) => {
