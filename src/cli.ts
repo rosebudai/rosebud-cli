@@ -193,7 +193,9 @@ async function sameFolder(a: string, b: string): Promise<boolean> {
     y !== undefined &&
     x.isDirectory() &&
     x.dev === y.dev &&
-    x.ino === y.ino
+    x.ino === y.ino &&
+    // Some filesystems report no inode numbers; zero names no particular folder.
+    x.ino !== 0n
   );
 }
 /** An argument that can be pasted into a shell as one word. */
@@ -226,7 +228,6 @@ function pullAdvice(options: {
   skipped: { path: string; reason: SkipReason }[];
   remoteCopies: string;
   version: string;
-  /** Where the last sync happened, when it was another folder than this one. */
   /** Set when this folder has no last sync, with where the last one was, if anywhere. */
   lastSync: { directory?: string } | undefined;
 }): string {

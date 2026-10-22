@@ -595,11 +595,112 @@ test(
         lines.every((line) => /^(in|out|refused state_locked)$/.test(line)),
         lines.join(", "),
       );
-      // Nothing is left behind: no lock, claim or temporary file.
-      assert.deepEqual(await readdir(dir), ["log"], `round ${round}`);
+      // Nothing is left behind: no lock, claim or temporary file. On Windows a
+      // scanner or indexer may still hold a handle on a temporary or claim file it
+      // opened as we removed it, so only the lock itself must be gone there.
+      assert.deepEqual(
+        (await readdir(dir)).filter(
+          (name) =>
+            process.platform !== "win32" || !/\.(tmp|claim)$/.test(name),
+        ),
+        ["log"],
+        `round ${round}`,
+      );
     }
   },
 );
+
+/** Run `body` in a fresh process, where `fs/promises` is stubbed by `stub` first. */
+async function withStub(stub, body, ...args) {
+  const script = `
+    import fsp from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    const args = process.argv.slice(1);
+    ${stub}
+    syncBuiltinESMExports();
+    const { withStateLock } = await import(${JSON.stringify(new URL("../dist/state.js", import.meta.url).href)});
+    ${body}`;
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", script, ...args],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let out = "";
+  child.stdout.on("data", (b) => (out += b));
+  child.stderr.on("data", (b) => (out += b));
+  const [code] = await once(child, "close");
+  return { code, out: out.trim() };
+}
+
+test("a disk whose hard links fail in any way but EEXIST still gets the lock, by an exclusive create in place", async (t) => {
+  for (const code of [
+    "EISDIR",
+    "EINVAL",
+    "EACCES",
+    "EMLINK",
+    "EIO",
+    "EPERM",
+    "ENOTSUP",
+  ]) {
+    const dir = await folder(t, {});
+    const state = join(dir, "project.json");
+    // Windows exFAT and SMB shares map a failed CreateHardLink to EISDIR or EINVAL.
+    const stub = `
+      const code = args[0];
+      fsp.link = async () => {
+        throw Object.assign(new Error(code + ": no hard links"), { code });
+      };`;
+    // The lock is created in place, a held one still refuses, and a stale one
+    // (whose claim file is made by the same function) is taken over.
+    const body = `
+      const [, state] = args;
+      const { writeFile } = fsp;
+      let log = "";
+      await withStateLock(state, async () => {
+        log += "held;";
+        await withStateLock(state, async () => {}).catch((e) => (log += e.code + ";"));
+      });
+      await writeFile(state + ".lock", "2147483646\\n");
+      await withStateLock(state, async () => { log += "taken;"; });
+      console.log(log);`;
+    const result = await withStub(stub, body, code, state);
+    assert.equal(
+      result.out,
+      "held;state_locked;taken;",
+      `${code}: ${result.out}`,
+    );
+    assert.deepEqual(await readdir(dir), [], code);
+  }
+});
+
+test("a lock that can't be read is held, not an empty one to take over", async (t) => {
+  const dir = await folder(t, {});
+  const state = join(dir, "project.json");
+  // An empty lock a minute old is stale, but the second read, which decides what
+  // to remove, fails: the file's holder is unknown, so it must stand.
+  const lock = `${state}.lock`;
+  await writeFile(lock, "");
+  const minuteAgo = new Date(Date.now() - 60_000);
+  await utimes(lock, minuteAgo, minuteAgo);
+  const stub = `
+    const real = fsp.readFile;
+    let reads = 0;
+    fsp.readFile = async (path, ...rest) => {
+      if (String(path).endsWith(".lock") && (reads += 1) > 1)
+        throw Object.assign(new Error("EACCES: denied"), { code: "EACCES" });
+      return real(path, ...rest);
+    };`;
+  const body = `
+    try {
+      await withStateLock(args[0], async () => {});
+      console.log("ran");
+    } catch (error) {
+      console.log(error.code);
+    }`;
+  const result = await withStub(stub, body, state);
+  assert.equal(result.out, "state_locked");
+  assert.equal(await readFile(lock, "utf8"), "", "the lock was not removed");
+});
 
 test("a lock naming this very process, which doesn't hold it, is stale", async (t) => {
   const { withStateLock } = await import("../dist/state.js");

@@ -220,17 +220,21 @@ export function releaseLocks(): number {
 const LOCK_TEXT = /^(\d{1,10})(?: ([0-9a-f-]{36}))?\n?$/;
 /** How long a lock may stay empty while it is written; an older empty one lost its process. */
 const EMPTY_LOCK_MS = 10_000;
-/** A lock's text and age; undefined when there is none. An unreadable one reads as new and empty. */
-async function readLock(
-  path: string,
-): Promise<{ text: string; ageMs: number } | undefined> {
+interface LockRead {
+  text: string;
+  ageMs: number;
+  /** The file is there but couldn't be read: its holder is unknown, so it is held. */
+  unreadable?: true;
+}
+/** A lock's text and age; undefined when there is none. An unreadable one is flagged, never judged empty. */
+async function readLock(path: string): Promise<LockRead | undefined> {
   try {
     const text = await readFile(path, "utf8");
     return { text, ageMs: Date.now() - (await lstat(path)).mtimeMs };
   } catch (error) {
     return error instanceof Error && "code" in error && error.code === "ENOENT"
       ? undefined
-      : { text: "", ageMs: 0 };
+      : { text: "", ageMs: 0, unreadable: true };
   }
 }
 const ownerOf = (text: string) => {
@@ -255,7 +259,8 @@ function running(pid: number): boolean {
  * was left by an earlier process with the same id. A lock that names no process is
  * stale only once it has been empty for a while: its creator was killed at once.
  */
-function stale(path: string, lock: { text: string; ageMs: number }): boolean {
+function stale(path: string, lock: LockRead): boolean {
+  if (lock.unreadable) return false;
   const pid = ownerOf(lock.text);
   if (pid === undefined) return lock.text === "" && lock.ageMs > EMPTY_LOCK_MS;
   return pid === process.pid
@@ -264,8 +269,9 @@ function stale(path: string, lock: { text: string; ageMs: number }): boolean {
 }
 /**
  * Create the lock file `path`, holding this process's id and a fresh token. It is
- * written aside and linked into place, so it never exists empty. Returns false
- * when it already exists.
+ * written aside and linked into place, so it never exists empty; a disk that
+ * can't link gets an exclusive create in place instead. Returns false when it
+ * already exists.
  */
 async function createLock(path: string): Promise<boolean> {
   const text = `${process.pid} ${randomUUID()}\n`;
@@ -276,11 +282,12 @@ async function createLock(path: string): Promise<boolean> {
     heldLocks.set(path, text);
     return true;
   } catch (error) {
-    const code = error instanceof Error && "code" in error ? error.code : "";
-    if (code === "EEXIST") return false;
-    if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"].includes(String(code)))
-      throw error;
-    // A disk without hard links: create it in place, empty for an instant.
+    if (error instanceof Error && "code" in error && error.code === "EEXIST")
+      return false;
+    // Any other failure means this disk can't link (Windows exFAT and SMB shares
+    // report EISDIR or EINVAL, others EPERM or ENOTSUP). The in-place create below
+    // is exclusive too, and fails if the lock is there, so it is safe to try;
+    // the file is empty for an instant.
     let file;
     try {
       file = await open(path, "wx", 0o600);
@@ -335,7 +342,9 @@ async function takeOver(
   for (let attempt = 0; attempt < 3 && depth < 8; attempt += 1) {
     if (await createLock(claim))
       try {
-        if ((await readLock(path))?.text === seen) await unlink(path);
+        const now = await readLock(path);
+        // An unreadable lock is never "the same empty one": its holder is unknown.
+        if (now && !now.unreadable && now.text === seen) await unlink(path);
         return true;
       } finally {
         await releaseLock(claim);
