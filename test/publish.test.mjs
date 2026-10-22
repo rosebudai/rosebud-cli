@@ -19,6 +19,7 @@ import { unzipSync, strFromU8 } from "fflate";
 import { posix, win32 } from "node:path";
 import { Rosebud, RosebudError } from "../dist/index.js";
 import { exposedToOtherUsers, outsideBuild } from "../dist/state.js";
+import { fakeRosebud } from "./fake-rosebud.mjs";
 
 const success = {
   project_id: "f6879913-2dda-484b-b1dc-3abc60cac45a",
@@ -46,6 +47,13 @@ async function api(t, handler) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const bytes = Buffer.concat(chunks);
+    // No upload sessions here: games with media go as one ZIP, as in 0.1.0.
+    if (req.url === "/api/developer/uploads/")
+      return json(
+        res,
+        { error: { code: "sync_unavailable", message: "off" } },
+        503,
+      );
     requests.push({
       method: req.method,
       url: req.url,
@@ -205,14 +213,14 @@ test("input errors explain the correction before any HTTP request", async (t) =>
 test("packaging refuses unsupported files, hidden files and links instead of dropping them", async (t) => {
   const remote = await api(t, (_req, res) => json(res, success));
   const client = new Rosebud({ apiBaseUrl: remote.base });
-  for (const [name, code] of [
-    ["source.ts", "unsupported_file"],
-    [".env", "unsafe_path"],
-    ["credentials.json", "excluded_file"],
+  for (const [name, code, content] of [
+    ["tool.exe", "unsupported_file", Buffer.from([0, 1, 2])],
+    [".env", "unsafe_path", "private"],
+    ["credentials.json", "excluded_file", "private"],
   ]) {
     const root = await directory(t, {
       "index.html": "<p>Game</p>",
-      [name]: "private",
+      [name]: content,
     });
     await assert.rejects(
       client.publish({ directory: root }),
@@ -226,6 +234,30 @@ test("packaging refuses unsupported files, hidden files and links instead of dro
     (e) => e.code === "unsupported_input",
   );
   assert.equal(remote.requests.length, 0);
+});
+
+test("Markdown notes publish with the game", async (t) => {
+  const root = await directory(t, {
+    "index.html": "<p>Game</p>",
+    "AGENTS.md": "# Notes",
+  });
+  const remote = await api(t, async (req, res, bytes) => {
+    const form = await new Response(bytes, {
+      headers: { "content-type": req.headers["content-type"] },
+    }).formData();
+    const files = unzipSync(
+      new Uint8Array(await form.get("bundle").arrayBuffer()),
+    );
+    assert.equal(strFromU8(files["AGENTS.md"]), "# Notes");
+    json(res, success);
+  });
+  assert.deepEqual(
+    await new Rosebud({ apiBaseUrl: remote.base }).publish({
+      directory: root,
+    }),
+    success,
+  );
+  assert.equal(remote.requests.length, 1);
 });
 
 test("archive and entry bounds fail before upload", async (t) => {
@@ -377,6 +409,7 @@ test("CLI uses the library contract and reserves stdout for the result", async (
   for (const key of Object.keys(success))
     assert.deepEqual(output[key], success[key]);
   assert.match(output.next_action, /connect/);
+  assert.match(output.next_action, /Run `rosebud connect` with/);
   assert.ok(output.next_action.includes(success.claim_expires_at));
 });
 
@@ -546,7 +579,60 @@ test("rejected uploads report the server's filename and limit but nothing else f
   assert.equal(error.filename, "assets/corrupt.png");
   assert.equal(error.limit, 10000);
   assert.equal(error.internal, undefined);
+  // Servers before ENG-4832 send the limit as a string; it is always shown as a number.
+  for (const [sent, shown] of [
+    ["134217728", 134217728],
+    ["000000000000001", 1],
+    ["12345678901234567", undefined],
+    ["12e3", undefined],
+    ["-5", undefined],
+    ["", undefined],
+    [1.5, undefined],
+    [1e21, undefined],
+    [null, undefined],
+  ]) {
+    const stub = await api(t, (_req, res) =>
+      json(
+        res,
+        { error: { code: "file_too_large", message: "Too big.", limit: sent } },
+        400,
+      ),
+    );
+    const odd = await cli([
+      "publish",
+      "--directory",
+      root,
+      "--api-base",
+      stub.base,
+    ]);
+    assert.equal(odd.code, 3);
+    assert.strictEqual(
+      JSON.parse(odd.stderr).error.limit,
+      shown,
+      JSON.stringify(sent),
+    );
+  }
 });
+
+test(
+  "an upload_retry wait is capped at ten seconds, whatever Retry-After says",
+  { timeout: 30000 },
+  async (t) => {
+    const game = await fakeRosebud(t, {
+      uploadRetries: 1,
+      uploadRetryAfter: 3600,
+    });
+    const root = await directory(t, {
+      "index.html": "x",
+      "assets/hero.png": Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    });
+    const started = Date.now();
+    await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+    const waited = Date.now() - started;
+    assert.ok(waited >= 9500 && waited < 20000, `waited ${waited} ms`);
+    assert.equal(game.uploadRetries, 0);
+  },
+);
 
 test("credentials only travel over HTTPS, except to a local server", () => {
   assert.throws(

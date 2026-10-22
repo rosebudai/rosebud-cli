@@ -60,8 +60,13 @@ async function rosebud(t) {
     downloads: [],
     loseJobResponse: false,
     throttle: [],
+    busy: 0,
+    busyPolls: 0,
     publishes: [],
     statusChecks: [],
+    scopes: ["assets:read", "assets:write", "games:write"],
+    keyExpiresAt: "2031-01-20T12:00:00Z",
+    refuse: null,
   };
   const job = (id) => {
     const row = api.jobs.get(id);
@@ -89,8 +94,23 @@ async function rosebud(t) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const path = new URL(req.url, "http://fake").pathname;
+    // No upload sessions here: games with media go as one ZIP, as in 0.1.0.
+    if (path === "/api/developer/uploads/") {
+      json(res, { error: { code: "sync_unavailable", message: "off" } }, 503);
+      return;
+    }
     if (path === "/api/developer/projects/import/") {
       api.publishes.push(req.headers.authorization);
+      if (api.refuse) {
+        const { status, code, message, scope } = api.refuse;
+        const error = {
+          code,
+          message,
+          ...(scope ? { required_scope: scope } : {}),
+        };
+        json(res, { error }, status);
+        return;
+      }
       if (api.login === "pending") {
         const error = { code: "login_pending", message: "Approve first." };
         json(res, { error }, 403);
@@ -161,13 +181,23 @@ async function rosebud(t) {
         status: api.login,
         client: "codex",
         name: "Moon Garden agent",
-        expires_at: active ? null : "2030-01-01T00:30:00Z",
+        scopes: api.scopes,
+        expires_at: active ? api.keyExpiresAt : "2030-01-01T00:30:00Z",
         account: active ? { display_name: "Mei", balance: 5000 } : null,
       });
       return;
     }
     if (api.login !== "active") {
       json(res, { detail: "Invalid key.", code: "invalid_key" }, 401);
+      return;
+    }
+    if (api.refuse) {
+      const { status, code, message, scope } = api.refuse;
+      json(
+        res,
+        { detail: message, code, ...(scope ? { required_scope: scope } : {}) },
+        status,
+      );
       return;
     }
     if (path === "/api/v1/asset-quotes/" && api.throttle.length) {
@@ -204,6 +234,11 @@ async function rosebud(t) {
     }
     if (path === "/api/v1/asset-jobs/") {
       api.jobPosts.push(body);
+      if (api.busy > 0) {
+        api.busy--;
+        json(res, { error: { code: "busy", message: "Try again." } }, 503);
+        return;
+      }
       const existing = [...api.jobs].find(
         ([, row]) => row.key === body.idempotency_key,
       );
@@ -230,6 +265,11 @@ async function rosebud(t) {
     }
     const polled = path.match(/^\/api\/v1\/asset-jobs\/([^/]+)\/$/);
     if (polled) {
+      if (api.busyPolls > 0) {
+        api.busyPolls--;
+        json(res, { error: { code: "busy", message: "Try again." } }, 503);
+        return;
+      }
       api.jobs.get(polled[1]).polls++;
       json(res, job(polled[1]));
       return;
@@ -309,6 +349,10 @@ test("login waits for the person's approval, whoami reports it and logout forget
   assert.equal(login.code, 0, login.stderr);
   assert.equal(login.data.status, "pending");
   assert.equal(login.data.approval_url, approval);
+  assert.match(
+    login.data.next_action,
+    /run `rosebud whoami`, then make assets\./,
+  );
   assert.ok(!login.stdout.includes(token));
   assert.deepEqual(api.logins, [
     { client: "codex", name: "Moon Garden agent" },
@@ -335,7 +379,10 @@ test("login waits for the person's approval, whoami reports it and logout forget
   // Logging in again reports the active login instead of replacing it.
   const again = await cli(root, api, ["login"]);
   assert.equal(again.data.status, "active");
-  assert.match(again.data.next_action, /logout/);
+  assert.match(
+    again.data.next_action,
+    /run `rosebud logout`, then `rosebud login`\./,
+  );
   assert.equal(api.logins.length, 1);
 
   const logout = await cli(root, api, ["logout"]);
@@ -420,6 +467,52 @@ test("assets quote and create map inputs, respect --max-credits and save the fin
   assert.equal(api.quotes.length, 3);
 });
 
+test("a busy answer while a create waits for its job is waited out like a throttle", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.busyPolls = 1;
+  const created = await cli(root, api, [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "Mossy stone tile",
+    "--out",
+    "art/moss.zip",
+  ]);
+  assert.equal(created.code, 0, created.stderr);
+  assert.equal(created.data.status, "succeeded");
+  assert.equal(api.busyPolls, 0);
+  assert.deepEqual(await readFile(join(root, "art/moss.zip")), sprite);
+  assert.equal(api.jobPosts.length, 1);
+});
+
+test("a busy refusal of a resumed create keeps its saved request, so the rerun still cannot pay twice", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const request = [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "Mossy stone tile",
+  ];
+  api.loseJobResponse = true;
+  assert.equal((await cli(root, api, request)).code, 4);
+  // Busy refused the retry before Rosebud looked the key up: a job may still hold it.
+  api.busy = 1;
+  const busy = await cli(root, api, request);
+  assert.equal(busy.code, 3, busy.stderr);
+  assert.equal(busy.error.code, "busy");
+  assert.equal(busy.error.outcome, "rejected");
+  const recovered = await cli(root, api, request);
+  assert.equal(recovered.code, 0, recovered.stderr);
+  assert.equal(recovered.data.resumed, true);
+  assert.equal(api.jobs.size, 1);
+  assert.equal(api.quotes.length, 1);
+  assert.deepEqual(api.jobPosts[2], api.jobPosts[0]);
+});
+
 test("rerunning a create after a lost response resumes the same job without paying twice", async (t) => {
   const { root, api } = await loggedIn(t);
   const request = [
@@ -449,6 +542,12 @@ test("rerunning a create after a lost response resumes the same job without payi
   const next = await cli(root, api, [...request, "--no-wait"]);
   assert.equal(next.code, 0, next.stderr);
   assert.notEqual(next.data.id, recovered.data.id);
+  assert.match(
+    next.data.next_action,
+    new RegExp(
+      `^Run \`rosebud assets status ${next.data.id}\` until it succeeds, then \`rosebud assets download <asset id> --out <file>\`\\.$`,
+    ),
+  );
   assert.equal(api.jobs.size, 2);
   assert.notEqual(
     api.jobPosts[2].idempotency_key,
@@ -487,6 +586,7 @@ test("a logged-in publish lands in the person's account, ready for update", asyn
   assert.equal(published.data.claimed, true);
   assert.equal(published.data.owner, "Mei");
   assert.match(published.data.next_action, /nothing to claim/);
+  assert.match(published.data.next_action, /with `rosebud update` and/);
   assert.ok(!("claim_url" in published.data));
   assert.ok(!published.stdout.includes(agentToken));
   const handle = JSON.parse(
@@ -510,4 +610,170 @@ test("a publish with a login still waiting for approval saves nothing", async (t
   assert.equal(refused.code, 3);
   assert.equal(refused.error.code, "login_pending");
   await assert.rejects(stat(join(root, ".rosebud", "project.json")));
+});
+
+test("whoami shows the login's scopes and expiry as Rosebud returns them", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.scopes = ["assets:read", "games:write"];
+  const active = await cli(root, api, ["whoami"]);
+  assert.equal(active.code, 0, active.stderr);
+  assert.deepEqual(active.data.scopes, ["assets:read", "games:write"]);
+  assert.equal(active.data.expires_at, "2031-01-20T12:00:00Z");
+
+  // An expired login is reported as such, and logging in again starts a new one.
+  api.login = "expired";
+  const expired = await cli(root, api, ["whoami"]);
+  assert.equal(expired.code, 0, expired.stderr);
+  assert.equal(expired.data.status, "expired");
+  const again = await cli(root, api, ["login"]);
+  assert.equal(again.data.status, "pending");
+  assert.equal(api.logins.length, 2);
+});
+
+test("an expired login tells the agent to log in again", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.refuse = {
+    status: 401,
+    code: "key_expired",
+    message:
+      "This login expired after 90 days without use. Run rosebud login again.",
+  };
+  const listed = await cli(root, api, ["assets", "list"]);
+  assert.equal(listed.code, 3);
+  assert.equal(listed.error.code, "key_expired");
+  // Rosebud's own message survives, rather than the generic "did not accept" one.
+  assert.match(listed.error.message, /90 days without use/);
+  assert.match(listed.error.next_action, /`rosebud login`/);
+  assert.doesNotMatch(listed.error.next_action, /logout/);
+
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "key_expired");
+  assert.match(published.error.next_action, /`rosebud login`/);
+});
+
+test("a login without a needed scope names it and says to log in again", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.refuse = {
+    status: 403,
+    code: "insufficient_scope",
+    message: "This key lacks the assets:write scope.",
+    scope: "assets:write",
+  };
+  const quoted = await cli(root, api, [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ]);
+  assert.equal(quoted.code, 3);
+  assert.equal(quoted.error.code, "insufficient_scope");
+  assert.equal(quoted.error.required_scope, "assets:write");
+  assert.match(
+    quoted.error.next_action,
+    /`rosebud logout`, then `rosebud login`/,
+  );
+  assert.match(quoted.error.next_action, /assets:write/);
+
+  // The publishing endpoints answer in their own shape, with the same result.
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "insufficient_scope");
+  assert.equal(published.error.required_scope, "assets:write");
+  assert.match(
+    published.error.next_action,
+    /`rosebud logout`, then `rosebud login`/,
+  );
+});
+
+test("assets create refused for an expired or under-scoped login says to rerun the identical command after logging in", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const create = [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+    "--out",
+    "moss.zip",
+  ];
+  for (const refuse of [
+    {
+      status: 401,
+      code: "key_expired",
+      message: "This login expired after 90 days without use.",
+    },
+    {
+      status: 403,
+      code: "insufficient_scope",
+      message: "This key lacks the assets:write scope.",
+      scope: "assets:write",
+    },
+  ]) {
+    api.refuse = refuse;
+    const failed = await cli(root, api, create);
+    assert.equal(failed.code, 3);
+    assert.equal(failed.error.code, refuse.code);
+    assert.match(
+      failed.error.next_action,
+      /approval_url to the person\. After they approve, rerun the identical `rosebud assets create` command; it resumes the saved request without paying again\.$/,
+    );
+  }
+  // Other commands are not told to rerun a create.
+  const quoted = await cli(root, api, [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ]);
+  assert.doesNotMatch(quoted.error.next_action, /assets create/);
+});
+
+test("a scope name that Rosebud does not send in the expected form is never repeated", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const quote = [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ];
+  api.refuse = {
+    status: 403,
+    code: "insufficient_scope",
+    message: "This key lacks a scope.",
+    scope: "assets:write`; echo hi",
+  };
+  const odd = await cli(root, api, quote);
+  assert.equal(odd.code, 3);
+  assert.equal(odd.error.required_scope, undefined);
+  assert.doesNotMatch(odd.stderr, /echo hi/);
+  assert.match(odd.error.next_action, /that permission/);
+  assert.match(odd.error.next_action, /`rosebud logout`, then `rosebud login`/);
+  // The publishing endpoints' shape, {error: {code, required_scope}}, is checked the same way.
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "insufficient_scope");
+  assert.equal(published.error.required_scope, undefined);
+  assert.doesNotMatch(published.stderr, /echo hi/);
+  assert.match(published.error.next_action, /that permission/);
+  // A scope of the right form but an unreasonable length is dropped too.
+  api.refuse = { ...api.refuse, scope: `${"a".repeat(33)}:write` };
+  const long = await cli(root, api, quote);
+  assert.equal(long.error.required_scope, undefined);
+  assert.match(long.error.next_action, /that permission/);
+
+  api.refuse = { ...api.refuse, scope: undefined };
+  const bare = await cli(root, api, quote);
+  assert.equal(bare.error.required_scope, undefined);
+  assert.match(bare.error.next_action, /that permission/);
 });

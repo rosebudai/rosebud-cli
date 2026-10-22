@@ -33,6 +33,13 @@ async function server(t, handler) {
     try {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
+      // No upload sessions here: games with media go as one ZIP, as in 0.1.0.
+      if (req.url === "/api/developer/uploads/")
+        return json(
+          res,
+          { error: { code: "sync_unavailable", message: "off" } },
+          503,
+        );
       await handler(req, res, Buffer.concat(chunks));
     } catch (error) {
       json(res, { error: { code: "fixture", message: String(error) } }, 500);

@@ -1,13 +1,22 @@
+import { openAsBlob } from "node:fs";
 import { link, mkdir, open, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { prepareBundle } from "./bundle.js";
+import { prepareRelease } from "./bundle.js";
+import type { MediaFile, PreparedRelease } from "./bundle.js";
 import { inputError, isObject, RosebudError } from "./errors.js";
 import type { JsonValue } from "./errors.js";
 
 export { RosebudError } from "./errors.js";
 export type { JsonValue, PublishOutcome, RosebudErrorKind } from "./errors.js";
+export {
+  prepareRelease,
+  FILE_BYTES,
+  GAME_FILES,
+  GAME_BYTES,
+} from "./bundle.js";
+export type { MediaFile, PreparedRelease } from "./bundle.js";
 
 export interface RosebudOptions {
   apiBaseUrl: string;
@@ -49,13 +58,35 @@ export interface GameMetadata {
 }
 export type BundleInput =
   { directory: string; zip?: never } | { zip: string; directory?: never };
-export type PublishOptions = BundleInput &
+export interface SignedUpload {
+  path: string;
+  url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+}
+export interface UploadSession {
+  upload_id: string;
+  upload_token: string;
+  expires_at: string;
+  /** Declared paths Rosebud already holds; nothing is uploaded for them. */
+  linked: string[];
+  uploads: SignedUpload[];
+}
+export type ReleaseInput = BundleInput &
   GameMetadata & {
-    context?: AdoptionContext;
-    /** A `rosebud login` token: the game goes straight into that account. */
-    token?: string;
+    /** From prepareRelease(); the build is not read again. */
+    prepared?: PreparedRelease;
+    /** Paths Rosebud holds as media (from a pull), sent as media whatever their type. */
+    knownMedia?: ReadonlySet<string>;
+    /** Paths Rosebud holds as text (from a pull), sent as text even with a media extension. */
+    knownText?: ReadonlySet<string>;
     signal?: AbortSignal;
   };
+export type PublishOptions = ReleaseInput & {
+  context?: AdoptionContext;
+  /** A `rosebud login` token: the game goes straight into that account. */
+  token?: string;
+};
 interface PublishedGame {
   project_id: string;
   play_url: string;
@@ -109,8 +140,7 @@ export interface ConnectionStatus {
   title?: string;
   play_url?: string;
 }
-export type UpdateOptions = BundleInput &
-  GameMetadata &
+export type UpdateOptions = ReleaseInput &
   AgentAuthorization & { expectedVersion: string; operationId: string };
 export interface UpdateResult {
   project_id: string;
@@ -139,6 +169,8 @@ export interface LoginStatus {
   login_id: string | null;
   status: "pending" | "active" | "expired" | "revoked";
   expires_at: string | null;
+  /** The scopes Rosebud enforces for this login; servers before ENG-4834 omit it. */
+  scopes?: string[];
   [key: string]: JsonValue;
 }
 export interface AssetModelInput {
@@ -173,6 +205,19 @@ export interface AssetJob {
   error: { code: string; message: string } | null;
   [key: string]: JsonValue;
 }
+/** The game's files as Rosebud holds them now, including edits made in Rosebud. */
+export interface GameFiles {
+  project_id: string;
+  content_version: string;
+  files: { path: string; content: string }[];
+  media: {
+    path: string;
+    url: string;
+    size: number | null;
+    md5: string | null;
+    media_file_id: string;
+  }[];
+}
 export interface AssetDownloadOptions {
   /** An asset's `url`; API paths are resolved against the API origin. */
   url: string;
@@ -197,7 +242,10 @@ function httpUrl(value: unknown): boolean {
   }
 }
 
-async function readResponse(response: Response): Promise<string> {
+async function readResponse(
+  response: Response,
+  limit = 1024 * 1024,
+): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -207,10 +255,12 @@ async function readResponse(response: Response): Promise<string> {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 1024 * 1024) {
+      if (size > limit) {
         await reader.cancel();
         throw new RosebudError(
-          "The response exceeded 1 MiB; the project may already exist. No retry was attempted.",
+          limit > 1024 * 1024
+            ? `The response exceeded ${limit} bytes.`
+            : "The response exceeded 1 MiB; the project may already exist. No retry was attempted.",
           {
             kind: "response",
             code: "unexpected_response",
@@ -281,17 +331,26 @@ function apiError(
       ? { message: result.error.message, code: result.error.code }
       : { message: result.detail, code: result.code }
     : undefined;
+  const code = typeof detail?.code === "string" ? detail.code : "http_error";
+  // Backpressure, and a server without file sync, refuse the request before
+  // anything runs, so unlike other 5xx answers their outcome is known: not applied.
+  const refused =
+    status === 503 && (code === "busy" || code === "sync_unavailable");
+  const busy = status === 503 && code === "busy";
+  const waits =
+    status === 429 || busy || (status === 409 && code === "upload_retry");
   return new RosebudError(
     typeof detail?.message === "string"
       ? detail.message
       : `Rosebud API returned HTTP ${status}.`,
     {
       kind: "api",
-      code: typeof detail?.code === "string" ? detail.code : "http_error",
-      outcome: status >= 400 && status < 500 ? "rejected" : "unknown",
+      code,
+      outcome:
+        (status >= 400 && status < 500) || refused ? "rejected" : "unknown",
       status,
       body: result,
-      ...(status === 429 && retryAfter && /^\d+$/.test(retryAfter)
+      ...(waits && retryAfter && /^\d{1,9}$/.test(retryAfter)
         ? { retryAfterSeconds: Number(retryAfter) }
         : {}),
     },
@@ -299,6 +358,25 @@ function apiError(
 }
 /** How long JSON requests wait out throttling, in total, before reporting it. */
 const throttleBudgetMs = 60_000;
+/**
+ * Asks for an upload session while Rosebud checks the game's existing files. Every
+ * identical request moves it along and its `remaining` count falls; a Rosebud that
+ * reports none is asked up to 20 times, and no progress is ever followed past 500.
+ */
+const uploadRetryAttempts = 20;
+const uploadRetryCeiling = 500;
+/** Answers in a row that may fail to lower `remaining` before the CLI stops asking. */
+const uploadRetryStalls = 2;
+/** The `remaining` count of an upload_retry answer, when it is a usable number. */
+function remainingPaths(error: RosebudError): number | undefined {
+  const detail = isObject(error.body) ? error.body.error : undefined;
+  const remaining = isObject(detail) ? detail.remaining : undefined;
+  return typeof remaining === "number" &&
+    Number.isInteger(remaining) &&
+    remaining >= 0
+    ? remaining
+    : undefined;
+}
 function downloadInterrupted(signal: AbortSignal): RosebudError {
   return new RosebudError(
     "The download was interrupted and no file was saved. Run the command again to retry it.",
@@ -310,6 +388,34 @@ function downloadInterrupted(signal: AbortSignal): RosebudError {
   );
 }
 const downloadLimit = 512 * 1024 * 1024;
+const filesLimit = 256 * 1024 * 1024;
+/**
+ * A failure before the release request: whatever happened to the upload session
+ * or its uploads, nothing was released. An answer from Rosebud refused the step;
+ * a lost or garbled one means it was never sent.
+ */
+function notReleased(error: unknown): unknown {
+  if (!(error instanceof RosebudError) || error.outcome !== "unknown")
+    return error;
+  const api = error.kind === "api";
+  return new RosebudError(
+    api
+      ? `${error.message.replace(/([^.!?])$/, "$1.")} Nothing was released; run the command again.`
+      : error.kind === "transport"
+        ? "The request for an upload session was interrupted. Nothing was released; run the command again."
+        : "Rosebud's answer to the request for an upload session was unexpected. Nothing was released; run the command again.",
+    {
+      kind: error.kind,
+      code: error.code,
+      outcome: api ? "rejected" : "not_sent",
+      ...(error.status !== undefined ? { status: error.status } : {}),
+      ...(error.body !== undefined ? { body: error.body } : {}),
+      ...(error.retryAfterSeconds !== undefined
+        ? { retryAfterSeconds: error.retryAfterSeconds }
+        : {}),
+    },
+  );
+}
 function unexpected(): never {
   throw new RosebudError(
     "The API returned an unexpected response. The operation may have completed; no retry was attempted.",
@@ -349,11 +455,7 @@ export async function readCover(path: string): Promise<Uint8Array> {
     throw inputError("thumbnail", "The thumbnail file could not be read.");
   }
 }
-async function gameForm(
-  options: BundleInput & GameMetadata & { signal?: AbortSignal },
-): Promise<FormData> {
-  if (!options || typeof options !== "object")
-    throw inputError("input_required", "Provide a directory or ZIP path.");
+function checkMetadata(options: GameMetadata): void {
   for (const key of ["name", "title"] as const) {
     if (
       options[key] !== undefined &&
@@ -381,24 +483,85 @@ async function gameForm(
       "description",
       "Use a description of at most 4000 characters.",
     );
-  if (options.signal?.aborted)
-    throw inputError("aborted", "Upload cancelled before sending.");
-  const bytes = await prepareBundle(options);
+}
+function metadataForm(
+  options: GameMetadata,
+  zip: Uint8Array,
+  cover: Uint8Array | undefined,
+): FormData {
   const form = new FormData();
   form.append(
     "bundle",
-    new Blob([new Uint8Array(bytes)], { type: "application/zip" }),
+    new Blob([new Uint8Array(zip)], { type: "application/zip" }),
     "game.zip",
   );
   for (const key of ["name", "title", "description"] as const)
     if (options[key] !== undefined) form.append(key, options[key]);
-  if (options.thumbnail !== undefined)
-    form.append(
-      "thumbnail",
-      new Blob([new Uint8Array(await readCover(options.thumbnail))]),
-      "cover",
-    );
+  if (cover !== undefined)
+    form.append("thumbnail", new Blob([new Uint8Array(cover)]), "cover");
   return form;
+}
+
+/**
+ * Headers a signed upload may never carry: credentials, and ones that belong to
+ * the connection rather than the request. Any other header the session returns
+ * goes as it is, so storage can add signed headers without breaking uploads.
+ */
+const refusedHeaders = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "upgrade",
+  "expect",
+]);
+/** An HTTP header name (RFC 9110 token) and a value without line breaks. */
+function signedHeader([name, value]: [string, JsonValue]): boolean {
+  return (
+    /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/.test(name) &&
+    !refusedHeaders.has(name.toLowerCase()) &&
+    typeof value === "string" &&
+    value.length <= 8192 &&
+    !/[\r\n\0]/.test(value)
+  );
+}
+function localOrHttps(value: unknown): value is string {
+  if (!httpUrl(value)) return false;
+  const url = new URL(value as string);
+  return (
+    url.protocol === "https:" ||
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+  );
+}
+const oneZipEntries =
+  "a game published here can hold at most 500 files and folders in one ZIP.";
+const oneZipBytes = "the whole game must fit in one 10 MiB ZIP.";
+/** The whole game in one ZIP, for a Rosebud that takes no upload sessions. */
+async function oneZip(input: ReleaseInput): Promise<PreparedRelease> {
+  try {
+    return await prepareRelease(input, {
+      splitMedia: false,
+      ...(input.knownMedia ? { knownMedia: input.knownMedia } : {}),
+      ...(input.knownText ? { knownText: input.knownText } : {}),
+    });
+  } catch (error) {
+    if (
+      error instanceof RosebudError &&
+      ["compressed_limit", "size_limit", "entry_limit"].includes(error.code)
+    )
+      throw inputError(
+        error.code,
+        `${error.message} This Rosebud server doesn't take file-by-file uploads yet, so ${error.code === "entry_limit" ? oneZipEntries : oneZipBytes}`,
+      );
+    throw error;
+  }
 }
 
 /** Node publishing client. Library calls never persist credentials or project files. */
@@ -413,7 +576,7 @@ export class Rosebud {
     } catch {
       throw inputError(
         "api_base",
-        "Provide an explicit HTTP(S) API origin in apiBaseUrl.",
+        "Use an HTTP(S) API origin with --api-base, such as https://api.rosebud.ai.",
       );
     }
     if (!httpUrl(url.href) || url.pathname !== "/" || url.search || url.hash)
@@ -439,15 +602,20 @@ export class Rosebud {
     )
       throw inputError(
         "timeout",
-        "timeoutMs must be a positive integer at most 2147483647.",
+        "Use --timeout-ms with a whole number of milliseconds, from 1 to 2147483647.",
       );
   }
 
   async publish(options: PublishOptions): Promise<PublishResult> {
-    const form = await gameForm(options);
+    // Checked first: the session request below already carries the token.
+    const token = options?.token;
+    if (token !== undefined) validateAccountToken(token);
+    const form = await this.releaseForm(
+      options,
+      token !== undefined ? { token } : {},
+    );
     if (options.context !== undefined)
       form.append("context", JSON.stringify(options.context));
-    if (options.token !== undefined) validateAccountToken(options.token);
     const body = await this.request(
       "/api/developer/projects/import/",
       "POST",
@@ -477,6 +645,99 @@ export class Rosebud {
     )
       unexpected();
     return body as unknown as PublishResult;
+  }
+
+  /** Declare media to Rosebud before the release; it answers with a signed upload per file it lacks. */
+  async createUploadSession(options: {
+    files: { path: string; size: number; md5: string }[];
+    /** With an agent token: a session for an update to this project. */
+    projectId?: string;
+    /** The agent token (with projectId), or an `rbk_` login (without). */
+    token?: string;
+    signal?: AbortSignal;
+  }): Promise<UploadSession> {
+    if (options.projectId !== undefined) {
+      projectPath(options.projectId);
+      validateToken(options.token ?? "");
+    } else if (options.token !== undefined) validateAccountToken(options.token);
+    const request = JSON.stringify({
+      files: options.files.map(({ path, size, md5 }) => ({ path, size, md5 })),
+      ...(options.projectId !== undefined
+        ? { project_id: options.projectId.toLowerCase() }
+        : {}),
+    });
+    let body: Record<string, JsonValue>;
+    let remaining: number | undefined;
+    let stalls = 0;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        body = await this.request(
+          "/api/developer/uploads/",
+          "POST",
+          request,
+          options.token,
+          options.signal,
+        );
+        break;
+      } catch (error) {
+        // Rosebud is still checking this game's existing files and every
+        // identical request moves it along, so ask again once it says to.
+        if (
+          !(error instanceof RosebudError) ||
+          error.kind !== "api" ||
+          error.status !== 409 ||
+          error.code !== "upload_retry" ||
+          attempt >= uploadRetryCeiling
+        )
+          throw error;
+        const left = remainingPaths(error);
+        if (left === undefined) {
+          if (attempt >= uploadRetryAttempts) throw error;
+        } else {
+          stalls =
+            remaining !== undefined && left >= remaining ? stalls + 1 : 0;
+          remaining = left;
+          if (stalls >= uploadRetryStalls) throw error;
+        }
+        await sleep(
+          Math.min(error.retryAfterSeconds ?? 1, 10) * 1000,
+          undefined,
+          { signal: options.signal },
+        ).catch(() => undefined);
+      }
+    }
+    // Every declared path comes back exactly once, linked or with a signed PUT.
+    const declared = new Set(options.files.map((file) => file.path));
+    const seen = new Set<string>();
+    const claim = (path: unknown) => {
+      if (typeof path !== "string" || !declared.has(path) || seen.has(path))
+        unexpected();
+      seen.add(path);
+    };
+    if (
+      typeof body.upload_id !== "string" ||
+      !uuid.test(body.upload_id) ||
+      typeof body.upload_token !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(body.upload_token) ||
+      typeof body.expires_at !== "string" ||
+      !Array.isArray(body.linked) ||
+      !Array.isArray(body.uploads)
+    )
+      unexpected();
+    body.linked.forEach(claim);
+    for (const upload of body.uploads) {
+      if (
+        !isObject(upload) ||
+        upload.method !== "PUT" ||
+        !localOrHttps(upload.url) ||
+        !isObject(upload.headers) ||
+        !Object.entries(upload.headers).every(signedHeader)
+      )
+        unexpected();
+      claim(upload.path);
+    }
+    if (seen.size !== declared.size) unexpected();
+    return body as unknown as UploadSession;
   }
 
   async connect(options: ConnectionOptions): Promise<ConnectionResult> {
@@ -529,6 +790,43 @@ export class Rosebud {
     return body as unknown as ConnectionStatus;
   }
 
+  /** The game's current files, including edits made in Rosebud. Needs code download. */
+  async files(options: AgentAuthorization): Promise<GameFiles> {
+    validateToken(options.agentToken);
+    const body = await this.request(
+      `${projectPath(options.projectId)}/files/`,
+      "GET",
+      undefined,
+      options.agentToken,
+      options.signal,
+      filesLimit,
+    );
+    if (
+      body.project_id !== options.projectId.toLowerCase() ||
+      typeof body.content_version !== "string" ||
+      !/^[a-f0-9]{64}$/.test(body.content_version) ||
+      !Array.isArray(body.files) ||
+      !Array.isArray(body.media) ||
+      !body.files.every(
+        (file) =>
+          isObject(file) &&
+          typeof file.path === "string" &&
+          typeof file.content === "string",
+      ) ||
+      !body.media.every(
+        (file) =>
+          isObject(file) &&
+          typeof file.path === "string" &&
+          typeof file.url === "string" &&
+          (file.size === null || Number.isSafeInteger(file.size)) &&
+          (file.md5 === null ||
+            (typeof file.md5 === "string" && /^[a-f0-9]{32}$/.test(file.md5))),
+      )
+    )
+      unexpected();
+    return body as unknown as GameFiles;
+  }
+
   async update(options: UpdateOptions): Promise<UpdateResult> {
     validateToken(options.agentToken);
     const path = projectPath(options.projectId);
@@ -538,7 +836,10 @@ export class Rosebud {
         "expected_version",
         "Use the content_version you last accepted for this project.",
       );
-    const form = await gameForm(options);
+    const form = await this.releaseForm(options, {
+      token: options.agentToken,
+      projectId: options.projectId,
+    });
     form.append("expected_version", options.expectedVersion);
     form.append("operation_id", options.operationId);
     const body = await this.request(
@@ -877,22 +1178,188 @@ export class Rosebud {
     return size;
   }
 
+  /** Declare the media and upload what Rosebud lacks; undefined when it takes no sessions. */
+  private async stage(
+    media: MediaFile[],
+    auth: { token?: string; projectId?: string },
+    signal?: AbortSignal,
+  ): Promise<UploadSession | undefined> {
+    let session: UploadSession;
+    try {
+      session = await this.createUploadSession({
+        files: media,
+        ...auth,
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      // An older Rosebud has no such route; project_unavailable is a real answer.
+      if (
+        error instanceof RosebudError &&
+        error.kind === "api" &&
+        ((error.status === 503 && error.code === "sync_unavailable") ||
+          (error.status === 404 && error.code !== "project_unavailable"))
+      )
+        return undefined;
+      throw error;
+    }
+    const files = new Map(media.map((file) => [file.path, file]));
+    const queue = [...session.uploads];
+    const stop = new AbortController();
+    const stopping = signal
+      ? AbortSignal.any([signal, stop.signal])
+      : stop.signal;
+    const worker = async () => {
+      for (let upload = queue.shift(); upload; upload = queue.shift()) {
+        const file = files.get(upload.path);
+        if (!file) unexpected();
+        try {
+          await this.put(upload, file, stopping);
+        } catch (error) {
+          // The first failure ends the others, so nothing is left running.
+          queue.length = 0;
+          stop.abort();
+          throw error;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(4, queue.length) }, worker),
+    );
+    return session;
+  }
+
+  /** One signed PUT. Repeating it replaces the bytes, so failures in transit are retried. */
+  private async put(
+    upload: SignedUpload,
+    file: MediaFile,
+    signal: AbortSignal,
+  ): Promise<void> {
+    // Time for the body grows with its size: the base timeout plus about 32 KiB/s.
+    const timeoutMs = Math.min(
+      2147483647,
+      this.timeoutMs + Math.ceil(file.size / (32 * 1024)) * 1000,
+    );
+    for (let attempt = 1; ; attempt += 1) {
+      // A file that can't be read now won't be by the next attempt.
+      let body: Blob;
+      try {
+        body = await openAsBlob(file.absolute);
+      } catch {
+        throw inputError(
+          "file_changed",
+          `${file.path} could not be read while uploading. Run the command again once the build has finished.`,
+        );
+      }
+      if (body.size !== file.size)
+        throw inputError(
+          "file_changed",
+          `${file.path} changed while uploading. Run the command again once the build has finished.`,
+        );
+      let status: number | undefined;
+      try {
+        // Only the signed headers go: the API credential never reaches storage.
+        const response = await fetch(upload.url, {
+          method: "PUT",
+          body,
+          headers: upload.headers,
+          // A redirect would carry the bytes somewhere the signature didn't name.
+          redirect: "error",
+          signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
+        });
+        await response.body?.cancel();
+        if (response.ok) return;
+        status = response.status;
+      } catch {
+        if (signal.aborted)
+          throw new RosebudError("Upload cancelled. Nothing was released.", {
+            kind: "transport",
+            code: "aborted",
+            outcome: "not_sent",
+          });
+      }
+      if (
+        status !== undefined &&
+        status < 500 &&
+        status !== 408 &&
+        status !== 429
+      )
+        throw new RosebudError(
+          `Storage refused ${file.path} (HTTP ${status}): it changed after it was read, or its upload link expired. Run the command again; nothing was released.`,
+          { kind: "api", code: "upload_rejected", outcome: "rejected", status },
+        );
+      if (attempt === 3)
+        throw new RosebudError(
+          `Could not upload ${file.path}. Run the command again; nothing was released. On a slow connection, allow more time with --timeout-ms.`,
+          { kind: "transport", code: "upload_failed", outcome: "not_sent" },
+        );
+      await sleep(attempt * 1000, undefined, { signal }).catch(() => undefined);
+    }
+  }
+
+  /** The release form; media goes first through an upload session when Rosebud takes one. */
+  private async releaseForm(
+    options: ReleaseInput,
+    auth: { token?: string; projectId?: string },
+  ): Promise<FormData> {
+    if (!options || typeof options !== "object")
+      throw inputError("input_required", "Provide a directory or ZIP path.");
+    checkMetadata(options);
+    // Read now, so a bad cover fails before any request or upload.
+    const cover =
+      options.thumbnail !== undefined
+        ? await readCover(options.thumbnail)
+        : undefined;
+    if (options.signal?.aborted)
+      throw inputError("aborted", "Upload cancelled before sending.");
+    let release =
+      options.prepared ??
+      (await prepareRelease(options, {
+        splitMedia: true,
+        ...(options.knownMedia ? { knownMedia: options.knownMedia } : {}),
+        ...(options.knownText ? { knownText: options.knownText } : {}),
+      }));
+    let session: UploadSession | undefined;
+    if (release.media.length) {
+      try {
+        session = await this.stage(release.media, auth, options.signal);
+      } catch (error) {
+        throw notReleased(error);
+      }
+      if (!session) release = await oneZip(options);
+    }
+    const form = metadataForm(options, release.zip, cover);
+    if (session) {
+      form.append("upload_id", session.upload_id);
+      form.append("upload_token", session.upload_token);
+    }
+    return form;
+  }
+
   private async request(
     path: string,
     method: string,
     body?: FormData | string,
     token?: string,
     cancellation?: AbortSignal,
+    responseLimit?: number,
   ): Promise<Record<string, JsonValue>> {
     let waitedMs = 0;
     for (;;) {
       try {
-        return await this.send(path, method, body, token, cancellation);
+        return await this.send(
+          path,
+          method,
+          body,
+          token,
+          cancellation,
+          responseLimit,
+        );
       } catch (error) {
         // Throttling refuses a request before Rosebud acts on it, so a JSON
         // request is sent again once the window reopens. Uploads never are.
         const waitMs =
           error instanceof RosebudError &&
+          error.status === 429 &&
           error.retryAfterSeconds !== undefined &&
           !(body instanceof FormData)
             ? (error.retryAfterSeconds + 1) * 1000
@@ -913,6 +1380,7 @@ export class Rosebud {
     body?: FormData | string,
     token?: string,
     cancellation?: AbortSignal,
+    responseLimit?: number,
   ): Promise<Record<string, JsonValue>> {
     if (cancellation?.aborted)
       throw inputError("aborted", "Request cancelled before sending.");
@@ -935,7 +1403,7 @@ export class Rosebud {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
-      text = await readResponse(response);
+      text = await readResponse(response, responseLimit);
     } catch (error) {
       if (error instanceof RosebudError) throw error;
       throw new RosebudError(
