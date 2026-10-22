@@ -151,15 +151,21 @@ const assetCommands: Record<string, number> = {
   list: 2,
   download: 3,
 };
-/** What Rosebud now holds, so a later pull can tell local edits from Rosebud's. */
-function remember(handle: ProjectHandle, release: PreparedRelease): void {
-  if (release.files && release.mediaPaths) {
+/** What Rosebud now holds, and the folder it came from, so a later pull there can tell local edits from Rosebud's. */
+function remember(
+  handle: ProjectHandle,
+  release: PreparedRelease,
+  directory: string | undefined,
+): void {
+  if (release.files && release.mediaPaths && directory !== undefined) {
     handle.files = release.files;
     handle.media = release.mediaPaths;
+    handle.directory = resolve(directory);
   } else {
     // A ZIP the CLI didn't build: unknown contents, so a pull compares everything.
     delete handle.files;
     delete handle.media;
+    delete handle.directory;
   }
 }
 /** An argument that can be pasted into a shell as one word. */
@@ -187,15 +193,28 @@ function pullAdvice(options: {
   directory: string;
   state: string | undefined;
   conflicts: PullPlan["conflicts"];
+  missing: string[];
   skipped: { path: string; reason: SkipReason }[];
   remoteCopies: string;
   version: string;
 }): string {
-  const { directory, state, conflicts, skipped, version } = options;
+  const { directory, state, conflicts, missing, skipped, version } = options;
   const flags = gameFlags(directory, state);
   const has = (reason: PullPlan["conflicts"][number]["reason"]) =>
     conflicts.some((c) => c.reason === reason);
   const notes: string[] = [];
+  // Deleted on purpose or lost, these look the same; say what the next update does with them.
+  const one = missing.length === 1;
+  const restore =
+    missing.length === 0
+      ? ""
+      : `${one ? "1 file Rosebud has is" : `${missing.length} files Rosebud has are`} missing here: ${missing
+          .slice(0, 10)
+          .map(quoted)
+          .join(
+            ", ",
+          )}${missing.length > 10 ? ", …" : ""}; your next update removes ${one ? "it" : "them"} from the game unless you restore ${one ? "it" : "them"}, and \`rosebud pull ${flags} --force\` restores ${one ? "it" : "them"}.`;
+  if (restore && conflicts.length > 0) notes.push(restore);
   if (skipped.some((s) => s.reason === "unsafe_path"))
     notes.push(
       "Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first.",
@@ -213,7 +232,9 @@ function pullAdvice(options: {
   const steps =
     conflicts.length === 0
       ? [
-          `${directory} now holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`,
+          restore
+            ? `${restore} Apart from that, ${directory} holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`
+            : `${directory} now holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`,
         ]
       : [
           ...(edits.length > 0
@@ -264,7 +285,8 @@ function malformedManifest(handle: ProjectHandle): boolean {
         Object.values(files).every((v) => typeof v === "string")
       )) ||
     (media !== undefined &&
-      !(Array.isArray(media) && media.every((v) => typeof v === "string")))
+      !(Array.isArray(media) && media.every((v) => typeof v === "string"))) ||
+    (handle.directory !== undefined && typeof handle.directory !== "string")
   );
 }
 /** Ids that help recover from an error, added to its JSON. */
@@ -449,7 +471,7 @@ async function main(): Promise<void> {
       };
       if (!publishedToAccount(result))
         handle.claim_expires_at = result.claim_expires_at;
-      remember(handle, release);
+      remember(handle, release, directory);
       const path = credentialPath(statePath, handle);
       outsideBuild(path, directory);
       await prepareCredentials(path);
@@ -605,12 +627,16 @@ async function main(): Promise<void> {
         game,
         directory: folder,
         remoteCopies,
-        ...(handle.files ? { base: handle.files } : {}),
+        // The last sync describes the folder it happened in, not this one.
+        ...(handle.files && handle.directory === folder
+          ? { base: handle.files }
+          : {}),
         force: values.force === true,
       });
       const conflicts = pulled.plan.conflicts;
       handle.files = pulled.files;
       handle.media = pulled.media;
+      handle.directory = folder;
       // A conflicted pull keeps the old version: update stays blocked until the
       // agent merges and names the version it merged against.
       if (conflicts.length === 0) handle.content_version = game.content_version;
@@ -623,6 +649,7 @@ async function main(): Promise<void> {
         written: pulled.plan.write,
         removed: pulled.plan.remove,
         local_only: pulled.plan.localOnly,
+        missing_locally: pulled.plan.missing,
         conflicts: conflicts.map(({ path, reason, clashesWith }) => ({
           path,
           reason,
@@ -634,6 +661,7 @@ async function main(): Promise<void> {
           directory: directory ?? "",
           state: value("state"),
           conflicts,
+          missing: pulled.plan.missing,
           skipped: pulled.skipped,
           remoteCopies,
           version: game.content_version,
@@ -718,7 +746,7 @@ async function main(): Promise<void> {
       });
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;
-      remember(handle, release);
+      remember(handle, release, directory);
       await saveState(statePath, handle);
       delete credentials.pending;
       await saveState(path, credentials);

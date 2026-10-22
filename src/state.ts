@@ -25,6 +25,8 @@ export interface ProjectHandle {
   files?: Record<string, string>;
   /** Paths Rosebud holds as media; absent for a handle from 0.1.0. */
   media?: string[];
+  /** The folder `files` describes, absolute; a pull into any other folder ignores `files`. */
+  directory?: string;
 }
 export interface Credentials {
   api_base_url: string;

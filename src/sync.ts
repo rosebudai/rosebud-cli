@@ -44,6 +44,11 @@ export interface PullPlan {
   }[];
   /** Files Rosebud never had; they stay and go up with the next update. */
   localOnly: string[];
+  /**
+   * In Rosebud and the last sync, unchanged in Rosebud, but not here: deleted here
+   * on purpose or lost. The next update deletes them from the game; --force restores them.
+   */
+  missing: string[];
   /** A path to write → the local file it lands on, when this disk spells that file differently. */
   localNames: Map<string, string>;
 }
@@ -75,7 +80,8 @@ const caseDiffers = (a: string, b: string) =>
 /**
  * Compare Rosebud's files, the folder and the last sync (each path → MD5).
  * Without a last sync every difference is a conflict, so nothing local is lost.
- * `force` settles conflicts for Rosebud; what changed only here is never touched.
+ * `force` settles conflicts for Rosebud and restores files missing here; an edit
+ * or new file made only here is never touched.
  *
  * Names are matched the way the disk matches them (`disk.fold`): a local file
  * spelled differently from Rosebud's is the same file, so an edit to it is never
@@ -96,6 +102,7 @@ export function planPull(
     remove: [],
     conflicts: [],
     localOnly: [],
+    missing: [],
     localNames: new Map(),
   };
   // Rosebud names that would land on one file or folder here, like Foo.js and
@@ -152,10 +159,12 @@ export function planPull(
       else if (same(l, L, b, B) || force) plan.remove.push(L);
       else plan.conflicts.push({ path: L, reason: "remote_deleted" });
     } else if (L === undefined) {
-      if (B === undefined || (force && !same(b, B, r, R))) take(R);
+      // The folder never lists a junk-named file, so after the first pull it is ignored, not missing.
+      if (B !== undefined && isOsJunk(R.slice(R.lastIndexOf("/") + 1))) return;
+      if (B === undefined || force) take(R);
       else if (!same(b, B, r, R))
         plan.conflicts.push({ path: R, reason: "local_deleted" });
-      // Deleted here and unchanged in Rosebud; the next update deletes it.
+      else plan.missing.push(R);
     } else if (same(r, R, l, L)) {
       // Already the same file and content.
     } else if (B !== undefined && same(l, L, b, B)) take(R, L);
@@ -238,7 +247,8 @@ export function planPull(
     );
     if (named.join("/") !== path) plan.localNames.set(path, named.join("/"));
   }
-  for (const list of [plan.write, plan.remove, plan.localOnly]) list.sort();
+  for (const list of [plan.write, plan.remove, plan.localOnly, plan.missing])
+    list.sort();
   plan.conflicts.sort(byPath);
   return plan;
 }
@@ -468,6 +478,7 @@ export async function pullInto(options: {
   directory: string;
   /** Absolute, outside `directory`; emptied on every pull. */
   remoteCopies: string;
+  /** The last sync of this folder; ignored when the folder holds no files. */
   base?: Record<string, string>;
   force: boolean;
 }): Promise<{
@@ -542,9 +553,11 @@ export async function pullInto(options: {
     // A file without a recorded MD5 is downloaded now to learn it.
     for (const [path, file] of media)
       if (file.md5 === null) remote.set(path, (await download(path)).md5);
-    const base = options.base
-      ? new Map(Object.entries(options.base))
-      : undefined;
+    // An empty or new folder has nothing of a last sync in it, whatever was saved.
+    const base =
+      options.base && local.size > 0
+        ? new Map(Object.entries(options.base))
+        : undefined;
     const plan = planPull(remote, local, base, options.force, {
       fold,
       folders,

@@ -548,6 +548,7 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
       { path: "goneEdited", reason: "remote_deleted" },
     ],
     localOnly: ["mine"],
+    missing: ["deletedHere"],
     localNames: new Map(),
   });
   // Without a last sync, every difference is a conflict, so nothing local is lost.
@@ -556,11 +557,13 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
     [{ path: "a", reason: "both_changed" }],
   );
   // --force settles conflicts for Rosebud, but leaves changes made only here alone.
+  // It also restores a file deleted here that Rosebud still has.
   assert.deepEqual(planPull(remote, local, base, true), {
-    write: ["both", "fresh", "remote"],
+    write: ["both", "deletedHere", "fresh", "remote"],
     remove: ["gone", "goneEdited"],
     conflicts: [],
     localOnly: ["mine"],
+    missing: [],
     localNames: new Map(),
   });
   assert.deepEqual(
@@ -575,6 +578,7 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
       remove: [],
       conflicts: [],
       localOnly: ["z"],
+      missing: [],
       localNames: new Map(),
     },
   );
@@ -635,6 +639,7 @@ test("planPull matches names the way the disk does, and refuses Rosebud names th
     remove: [],
     conflicts: [],
     localOnly: [],
+    missing: [],
     localNames: new Map(),
   });
   // …and when Rosebud changed it too, it is a conflict.
@@ -858,6 +863,91 @@ test("pull removes what Rosebud deleted, keeps files Rosebud never had and local
   // Rosebud's manifest is the new base: neither local file is part of it as an edit of Rosebud's.
   assert.equal((await handle(root)).files["old.js"], undefined);
   assert.equal((await handle(root)).files["keep.js"], md5(Buffer.from("1")));
+});
+
+test("pull into a folder that was deleted writes every file again", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+  });
+  await rm(join(root, "dist"), { recursive: true });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "synced");
+  assert.deepEqual(pull.data.written, ["game.js", "index.html"]);
+  assert.deepEqual(pull.data.missing_locally, []);
+  assert.equal(await readFile(join(root, "dist/game.js"), "utf8"), "1");
+  // An emptied folder is the same: nothing in it, so nothing of a last sync.
+  await rm(join(root, "dist/game.js"));
+  await rm(join(root, "dist/index.html"));
+  await writeFile(join(root, "dist/.DS_Store"), "junk");
+  const emptied = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(emptied.data.written, ["game.js", "index.html"]);
+});
+
+test("pull into another folder than the last sync's writes every file there", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+  });
+  await mkdir(join(root, "game"));
+  await writeFile(join(root, "game/notes.txt"), "mine");
+  const pull = await run(root, ["pull", "--directory", "game"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.written, ["game.js", "index.html"]);
+  assert.deepEqual(pull.data.local_only, ["notes.txt"]);
+  assert.deepEqual(pull.data.missing_locally, []);
+  assert.match(pull.data.directory, /game$/);
+  assert.equal((await handle(root)).directory, pull.data.directory);
+  // Back in the first folder, its files are compared without that other sync.
+  await rm(join(root, "dist/game.js"));
+  const back = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(back.data.written, ["game.js"]);
+  assert.equal(back.data.status, "synced");
+});
+
+test("files deleted here are reported, --force restores them, and the next update deletes them", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+    "art.js": "2",
+  });
+  await rm(join(root, "dist/game.js"));
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "synced");
+  assert.deepEqual(pull.data.written, []);
+  assert.deepEqual(pull.data.missing_locally, ["game.js"]);
+  assert.match(
+    pull.data.next_action,
+    /1 file Rosebud has is missing here: `game\.js`/,
+  );
+  assert.match(
+    pull.data.next_action,
+    /your next update removes it from the game/,
+  );
+  assert.match(
+    pull.data.next_action,
+    /`rosebud pull --directory dist --force` restores it/,
+  );
+  assert.match(pull.data.next_action, /^1 file Rosebud has is missing here/);
+  await assert.rejects(readFile(join(root, "dist/game.js")));
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.deepEqual(forced.data.written, ["game.js"]);
+  assert.deepEqual(forced.data.missing_locally, []);
+  assert.equal(await readFile(join(root, "dist/game.js"), "utf8"), "1");
+  // A deliberate deletion still goes up with the next update.
+  await rm(join(root, "dist/game.js"));
+  await rm(join(root, "dist/art.js"));
+  const again = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(again.data.missing_locally, ["art.js", "game.js"]);
+  assert.match(again.data.next_action, /2 files Rosebud has are missing here/);
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual([...game.text.keys()], ["index.html"]);
 });
 
 test("pull keeps conflicting local edits, saves Rosebud's copy beside the state, and update still needs --expected-version", async (t) => {
@@ -1197,7 +1287,7 @@ test("a conflicting media file's copy comes from the same single download", asyn
   assert.equal((await readFile(join(root, "dist/assets/hero.png"))).length, 24);
 });
 
-test("a handle whose files or media are malformed is refused", async (t) => {
+test("a handle whose files, media or folder are malformed is refused", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, {
     "index.html": "one",
@@ -1214,6 +1304,8 @@ test("a handle whose files or media are malformed is refused", async (t) => {
     { media: null },
     { media: {} },
     { media: [1] },
+    { directory: 1 },
+    { directory: null },
   ]) {
     await writeFile(state, JSON.stringify({ ...good, ...bad }));
     const refused = await run(root, ["status"]);
@@ -1728,7 +1820,7 @@ test("without a Retry-After, an upload_retry is asked again after one second", a
   assert.equal(game.uploadRetries, 0);
 });
 
-test("pull --force settles conflicts for Rosebud but never touches changes made only here", async (t) => {
+test("pull --force settles conflicts for Rosebud and restores missing files, but never touches edits made only here", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, {
     "index.html": "one",
@@ -1742,7 +1834,7 @@ test("pull --force settles conflicts for Rosebud but never touches changes made 
   const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
   assert.equal(forced.code, 0, JSON.stringify(forced.error));
   assert.equal(forced.data.status, "synced");
-  assert.deepEqual(forced.data.written, ["index.html"]);
+  assert.deepEqual(forced.data.written, ["index.html", "old.js"]);
   assert.deepEqual(forced.data.removed, []);
   assert.deepEqual(forced.data.local_only, []);
   assert.equal(
@@ -1753,12 +1845,12 @@ test("pull --force settles conflicts for Rosebud but never touches changes made 
     await readFile(join(root, "dist/game.js"), "utf8"),
     "edited here",
   );
-  await assert.rejects(readFile(join(root, "dist/old.js")));
-  // Both local-only changes still go up with the next update.
+  assert.equal(await readFile(join(root, "dist/old.js"), "utf8"), "1");
+  // The edit made only here still goes up with the next update.
   const update = await run(root, ["update", "--directory", "dist"]);
   assert.equal(update.code, 0, JSON.stringify(update.error));
   assert.equal(game.text.get("game.js"), "edited here");
-  assert.equal(game.text.has("old.js"), false);
+  assert.equal(game.text.get("old.js"), "1");
 });
 
 test("pull --force removes a file Rosebud deleted that was edited here", async (t) => {
@@ -1893,6 +1985,8 @@ test("a junk-named file that Rosebud holds is written by pull, then ignored, so 
   const again = await run(root, ["pull", "--directory", "dist"]);
   assert.equal(again.data.status, "synced");
   assert.deepEqual(again.data.local_only, []);
+  // The folder ignores it rather than missing it, so it is not reported as missing.
+  assert.deepEqual(again.data.missing_locally, []);
   const update = await run(root, ["update", "--directory", "dist"]);
   assert.equal(update.code, 0, JSON.stringify(update.error));
   assert.deepEqual([...game.text.keys()], ["index.html"]);
