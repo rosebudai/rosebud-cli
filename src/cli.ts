@@ -23,6 +23,7 @@ import type {
   LoginStatus,
 } from "./index.js";
 import { inputError, isObject } from "./errors.js";
+import { pullInto } from "./sync.js";
 import {
   accountPath,
   assetRequestPath,
@@ -128,6 +129,7 @@ const projectCommands = [
   "connect",
   "status",
   "update",
+  "pull",
   "disconnect",
 ];
 /** Positional arguments each assets subcommand takes, including "assets". */
@@ -240,7 +242,7 @@ async function main(): Promise<void> {
   if (positionals.length !== 1 || !projectCommands.includes(command))
     throw inputError(
       "usage",
-      "Choose publish, connect, status, update, disconnect, login, whoami, logout or assets.",
+      "Choose publish, connect, status, update, pull, disconnect, login, whoami, logout or assets.",
     );
   const directory = value("directory"),
     zip = value("zip");
@@ -249,6 +251,11 @@ async function main(): Promise<void> {
     throw inputError(
       "input_required",
       "Choose exactly one --directory or --zip.",
+    );
+  if (command === "pull" && (directory === undefined || zip !== undefined))
+    throw inputError(
+      "input_required",
+      "Use --directory with the folder to bring the game into.",
     );
   const input: BundleInput =
     directory !== undefined ? { directory } : { zip: zip ?? "" };
@@ -474,6 +481,60 @@ async function main(): Promise<void> {
         "connection_required",
         "Run rosebud connect and have the person approve access.",
       );
+    if (command === "pull") {
+      const remoteCopies = `${statePath.replace(/\.json$/i, "")}.remote`;
+      outsideBuild(remoteCopies, directory);
+      const folder = resolve(directory ?? "");
+      const game = await api.files({
+        projectId: handle.project_id,
+        agentToken: credentials.agent_token,
+      });
+      const pulled = await pullInto({
+        api,
+        game,
+        directory: folder,
+        remoteCopies,
+        ...(handle.files ? { base: handle.files } : {}),
+        force: values.force === true,
+      });
+      const conflicts = pulled.plan.conflicts;
+      // A conflicted path keeps its old base: pulling again must still report it,
+      // not mistake the unmerged local file for an ordinary local edit.
+      const before = new Map(Object.entries(handle.files ?? {}));
+      const files = new Map(Object.entries(pulled.files));
+      for (const { path } of conflicts) {
+        const old = before.get(path);
+        if (old === undefined) files.delete(path);
+        else files.set(path, old);
+      }
+      handle.files = Object.fromEntries(files);
+      handle.media = pulled.media;
+      // A conflicted pull keeps the old version: update stays blocked until the
+      // agent merges and names the version it merged against.
+      if (conflicts.length === 0) handle.content_version = game.content_version;
+      await saveState(statePath, handle);
+      const where = directory ?? "";
+      output({
+        project_id: handle.project_id,
+        content_version: game.content_version,
+        directory: folder,
+        status: conflicts.length > 0 ? "conflicts" : "synced",
+        written: pulled.plan.write,
+        removed: pulled.plan.remove,
+        local_only: pulled.plan.localOnly,
+        conflicts: conflicts.map(({ path, reason }) => ({
+          path,
+          reason,
+          rosebud_copy: pulled.copies[path] ?? null,
+        })),
+        skipped: pulled.skipped,
+        next_action:
+          conflicts.length > 0
+            ? `These files changed both here and in Rosebud: ${conflicts.map((c) => c.path).join(", ")}. Rosebud's copies are in ${remoteCopies}. Merge each into your file, keeping both changes (a file Rosebud deleted has no copy: keep it to restore it, or delete it), then run rosebud update --directory ${where} --expected-version ${game.content_version}. rosebud pull --force takes Rosebud's copies instead.`
+            : `${where} now holds Rosebud's current version. Edit it, then run rosebud update --directory ${where}.${pulled.skipped.length > 0 ? " Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first." : ""}`,
+      });
+      return;
+    }
     if (command === "disconnect") {
       await api.disconnect({
         projectId: handle.project_id,
@@ -1078,6 +1139,7 @@ async function createAsset(
 function apiDetails(error: RosebudError): {
   filename?: string;
   limit?: number;
+  changed_paths?: string[] | null;
 } {
   const body = error.body;
   if (
@@ -1090,7 +1152,8 @@ function apiDetails(error: RosebudError): {
   const details = body.error;
   if (!details || typeof details !== "object" || Array.isArray(details))
     return {};
-  const { filename, limit } = details;
+  const { filename, limit, changed_paths: changed } = details;
+  const paths = pathList(changed);
   return {
     ...(typeof filename === "string" && filename.length <= 512
       ? { filename }
@@ -1098,7 +1161,17 @@ function apiDetails(error: RosebudError): {
     ...(typeof limit === "number" && Number.isSafeInteger(limit)
       ? { limit }
       : {}),
+    ...(paths !== undefined ? { changed_paths: paths } : {}),
   };
+}
+/** The files an update conflict names: null when Rosebud can't tell, else a bounded list. */
+function pathList(value: JsonValue | undefined): string[] | null | undefined {
+  if (value === null) return null;
+  return Array.isArray(value) &&
+    value.length <= 2000 &&
+    value.every((path) => typeof path === "string" && path.length <= 500)
+    ? (value as string[])
+    : undefined;
 }
 
 main().catch((error: unknown) => {

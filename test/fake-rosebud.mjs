@@ -41,6 +41,9 @@ export async function fakeRosebud(t, options = {}) {
     refusePuts: options.refusePuts ?? false,
     putDelayMs: options.putDelayMs ?? 0,
     loseNextRelease: false,
+    hideMd5: options.hideMd5 ?? false, // files() reports no MD5, as for old uploads
+    failMedia: options.failMedia ?? 0, // media downloads answered 503, one each
+    damageMedia: options.damageMedia ?? false, // media downloads lose their last byte
   };
   const manifest = () =>
     new Map([
@@ -111,7 +114,12 @@ export async function fakeRosebud(t, options = {}) {
         const data = game.media.get(
           decodeURIComponent(route.slice("/media/".length)),
         );
-        return res.writeHead(data ? 200 : 404).end(data ?? "");
+        if (data && game.failMedia > 0) {
+          game.failMedia -= 1;
+          return res.writeHead(503).end();
+        }
+        const sent = data && game.damageMedia ? data.subarray(0, -1) : data;
+        return res.writeHead(data ? 200 : 404).end(sent ?? "");
       }
       if (route === "/api/developer/uploads/" && req.method === "POST") {
         if (!game.sync) return fail(res, 503, "sync_unavailable");
@@ -236,7 +244,7 @@ export async function fakeRosebud(t, options = {}) {
             path,
             url: `/media/${encodeURIComponent(path)}`,
             size: data.length,
-            md5: md5(data),
+            md5: game.hideMd5 ? null : md5(data),
             media_file_id: randomUUID(),
           })),
         });

@@ -201,6 +201,19 @@ export interface AssetJob {
   error: { code: string; message: string } | null;
   [key: string]: JsonValue;
 }
+/** The game's files as Rosebud holds them now, including edits made in Rosebud. */
+export interface GameFiles {
+  project_id: string;
+  content_version: string;
+  files: { path: string; content: string }[];
+  media: {
+    path: string;
+    url: string;
+    size: number | null;
+    md5: string | null;
+    media_file_id: string;
+  }[];
+}
 export interface AssetDownloadOptions {
   /** An asset's `url`; API paths are resolved against the API origin. */
   url: string;
@@ -225,7 +238,10 @@ function httpUrl(value: unknown): boolean {
   }
 }
 
-async function readResponse(response: Response): Promise<string> {
+async function readResponse(
+  response: Response,
+  limit = 1024 * 1024,
+): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -235,10 +251,12 @@ async function readResponse(response: Response): Promise<string> {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 1024 * 1024) {
+      if (size > limit) {
         await reader.cancel();
         throw new RosebudError(
-          "The response exceeded 1 MiB; the project may already exist. No retry was attempted.",
+          limit > 1024 * 1024
+            ? `The response exceeded ${limit} bytes.`
+            : "The response exceeded 1 MiB; the project may already exist. No retry was attempted.",
           {
             kind: "response",
             code: "unexpected_response",
@@ -338,6 +356,7 @@ function downloadInterrupted(signal: AbortSignal): RosebudError {
   );
 }
 const downloadLimit = 512 * 1024 * 1024;
+const filesLimit = 256 * 1024 * 1024;
 function unexpected(): never {
   throw new RosebudError(
     "The API returned an unexpected response. The operation may have completed; no retry was attempted.",
@@ -658,6 +677,43 @@ export class Rosebud {
     )
       unexpected();
     return body as unknown as ConnectionStatus;
+  }
+
+  /** The game's current files, including edits made in Rosebud. Needs code download. */
+  async files(options: AgentAuthorization): Promise<GameFiles> {
+    validateToken(options.agentToken);
+    const body = await this.request(
+      `${projectPath(options.projectId)}/files/`,
+      "GET",
+      undefined,
+      options.agentToken,
+      options.signal,
+      filesLimit,
+    );
+    if (
+      body.project_id !== options.projectId.toLowerCase() ||
+      typeof body.content_version !== "string" ||
+      !/^[a-f0-9]{64}$/.test(body.content_version) ||
+      !Array.isArray(body.files) ||
+      !Array.isArray(body.media) ||
+      !body.files.every(
+        (file) =>
+          isObject(file) &&
+          typeof file.path === "string" &&
+          typeof file.content === "string",
+      ) ||
+      !body.media.every(
+        (file) =>
+          isObject(file) &&
+          typeof file.path === "string" &&
+          typeof file.url === "string" &&
+          (file.size === null || Number.isSafeInteger(file.size)) &&
+          (file.md5 === null ||
+            (typeof file.md5 === "string" && /^[a-f0-9]{32}$/.test(file.md5))),
+      )
+    )
+      unexpected();
+    return body as unknown as GameFiles;
   }
 
   async update(options: UpdateOptions): Promise<UpdateResult> {
@@ -1169,11 +1225,19 @@ export class Rosebud {
     body?: FormData | string,
     token?: string,
     cancellation?: AbortSignal,
+    responseLimit?: number,
   ): Promise<Record<string, JsonValue>> {
     let waitedMs = 0;
     for (;;) {
       try {
-        return await this.send(path, method, body, token, cancellation);
+        return await this.send(
+          path,
+          method,
+          body,
+          token,
+          cancellation,
+          responseLimit,
+        );
       } catch (error) {
         // Throttling refuses a request before Rosebud acts on it, so a JSON
         // request is sent again once the window reopens. Uploads never are.
@@ -1199,6 +1263,7 @@ export class Rosebud {
     body?: FormData | string,
     token?: string,
     cancellation?: AbortSignal,
+    responseLimit?: number,
   ): Promise<Record<string, JsonValue>> {
     if (cancellation?.aborted)
       throw inputError("aborted", "Request cancelled before sending.");
@@ -1221,7 +1286,7 @@ export class Rosebud {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
-      text = await readResponse(response);
+      text = await readResponse(response, responseLimit);
     } catch (error) {
       if (error instanceof RosebudError) throw error;
       throw new RosebudError(
