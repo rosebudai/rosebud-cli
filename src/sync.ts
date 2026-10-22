@@ -18,6 +18,8 @@ import type { GameFiles, Rosebud } from "./index.js";
 
 export type ConflictReason =
   "both_changed" | "local_deleted" | "remote_deleted";
+/** Why a path Rosebud holds was not brought in; a duplicate keeps its first copy. */
+export type SkipReason = "unsafe_path" | "duplicate_path";
 export interface PullPlan {
   /** Paths to take from Rosebud. */
   write: string[];
@@ -29,11 +31,15 @@ export interface PullPlan {
   localOnly: string[];
 }
 const LOCAL_LIMIT = 10_000;
+/** What an interrupted download leaves behind: `name.<uuid>.part`. */
+const LEFTOVER =
+  /\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.part$/i;
 const UNSAFE = /[<>:"\\|?*\u0000-\u001f\u007f]/u;
 
 /**
  * Compare Rosebud's files, the folder and the last sync (each path → MD5).
  * Without a last sync every difference is a conflict, so nothing local is lost.
+ * `force` settles conflicts for Rosebud; what changed only here is never touched.
  */
 export function planPull(
   remote: ReadonlyMap<string, string>,
@@ -54,12 +60,15 @@ export function planPull(
     if (r === l) continue;
     if (r !== undefined) {
       if (l === undefined) {
-        if (b === undefined || force) plan.write.push(path);
+        if (b === undefined || (force && b !== r)) plan.write.push(path);
         else if (b !== r)
           plan.conflicts.push({ path, reason: "local_deleted" });
         // b === r: deleted here and unchanged in Rosebud; the next update deletes it.
-      } else if (l === b || force) plan.write.push(path);
-      else if (r !== b) plan.conflicts.push({ path, reason: "both_changed" });
+      } else if (l === b) plan.write.push(path);
+      else if (b === undefined || r !== b) {
+        if (force) plan.write.push(path);
+        else plan.conflicts.push({ path, reason: "both_changed" });
+      }
       // r === b: changed here only; the next update sends it.
     } else if (b === undefined) plan.localOnly.push(path);
     else if (l === b || force) plan.remove.push(path);
@@ -101,17 +110,24 @@ async function md5File(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
+const pathConflict = (what: string) =>
+  inputError("path_conflict", `${what}. Rename or remove it, then pull again.`);
 const linkRefused = (path: string) =>
   inputError(
     "unsupported_input",
     `Remove symbolic links and special files from the folder: ${path}`,
   );
 
-/** Every file in the folder, path → MD5. Links are refused, never followed. */
+/**
+ * Every game file in the folder, path → MD5. Links are refused, never followed.
+ * Hidden entries and leftover temporary files are not game files: update never
+ * uploads them and pull never writes them.
+ */
 async function localFiles(root: string): Promise<Map<string, string>> {
   const found = new Map<string, string>();
   async function walk(path: string): Promise<void> {
     for (const name of (await readdir(join(root, path))).sort()) {
+      if (name.startsWith(".") || LEFTOVER.test(name)) continue;
       const child = path ? `${path}/${name}` : name;
       const info = await lstat(join(root, child));
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
@@ -146,34 +162,23 @@ async function prepareTarget(root: string, path: string): Promise<string> {
   const parts = path.split("/");
   let current = root;
   await mkdir(root, { recursive: true });
-  for (const part of parts.slice(0, -1)) {
+  for (const [index, part] of parts.slice(0, -1).entries()) {
     current = join(current, part);
     const info = await lstat(current).catch(() => undefined);
     if (!info) await mkdir(current);
     else if (info.isSymbolicLink()) throw linkRefused(path);
     else if (!info.isDirectory())
-      throw inputError(
-        "path_conflict",
-        `${part} is a file here but a folder in Rosebud. Rename or remove it, then pull again: ${path}`,
+      throw pathConflict(
+        `${parts.slice(0, index + 1).join("/")} is a file here but a folder in Rosebud, which holds ${path}`,
       );
   }
-  return join(root, ...parts);
+  const target = join(root, ...parts);
+  if ((await lstat(target).catch(() => undefined))?.isDirectory())
+    throw pathConflict(`${path} is a folder here but a file in Rosebud`);
+  return target;
 }
 
-async function writeAtomically(
-  target: string,
-  bytes: Uint8Array,
-): Promise<void> {
-  const temporary = `${target}.${randomUUID()}.part`;
-  try {
-    await writeFile(temporary, bytes, { flag: "wx" });
-    await rename(temporary, target);
-  } finally {
-    await unlink(temporary).catch(() => undefined);
-  }
-}
-
-/** Move a verified download into place; across devices it is copied first. */
+/** Move a staged file into place; across devices it is copied beside the target first. */
 async function place(from: string, to: string): Promise<void> {
   try {
     await rename(from, to);
@@ -215,7 +220,7 @@ export async function pullInto(options: {
   force: boolean;
 }): Promise<{
   plan: PullPlan;
-  skipped: { path: string; reason: "unsafe_path" }[];
+  skipped: { path: string; reason: SkipReason }[];
   /** Rosebud's manifest: path → MD5. */
   files: Record<string, string>;
   media: string[];
@@ -232,13 +237,16 @@ export async function pullInto(options: {
       "state_in_build",
       "--directory can't sit inside the folder where pull saves Rosebud's copies (the --state file's name without .json, plus .remote). Choose another folder.",
     );
-  const skipped: { path: string; reason: "unsafe_path" }[] = [];
+  const skipped: { path: string; reason: SkipReason }[] = [];
   const texts = new Map<string, Uint8Array>();
   const media = new Map<string, GameFiles["media"][number]>();
   const remote = new Map<string, string>();
   for (const file of game.files) {
     if (!safePath(file.path) || remote.has(file.path)) {
-      skipped.push({ path: file.path, reason: "unsafe_path" });
+      skipped.push({
+        path: file.path,
+        reason: safePath(file.path) ? "duplicate_path" : "unsafe_path",
+      });
       continue;
     }
     const bytes = new TextEncoder().encode(file.content);
@@ -246,8 +254,12 @@ export async function pullInto(options: {
     remote.set(file.path, md5Of(bytes));
   }
   for (const file of game.media) {
-    if (!safePath(file.path) || remote.has(file.path) || media.has(file.path)) {
-      skipped.push({ path: file.path, reason: "unsafe_path" });
+    const duplicate = remote.has(file.path) || media.has(file.path);
+    if (!safePath(file.path) || duplicate) {
+      skipped.push({
+        path: file.path,
+        reason: safePath(file.path) ? "duplicate_path" : "unsafe_path",
+      });
       continue;
     }
     media.set(file.path, file);
@@ -281,8 +293,24 @@ export async function pullInto(options: {
     );
     const fetchTo = async (path: string, target: string) => {
       const text = texts.get(path);
-      if (text) return writeAtomically(target, text);
-      await place((held.get(path) ?? (await download(path))).to, target);
+      let from: string;
+      if (text) {
+        // Staged beside the downloads, so the folder never holds a half-written file.
+        from = join(incoming, randomUUID());
+        await mkdir(incoming, { recursive: true });
+        await writeFile(from, text, { flag: "wx" });
+      } else from = (held.get(path) ?? (await download(path))).to;
+      try {
+        await place(from, target);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          ["EISDIR", "ENOTDIR", "EEXIST"].includes(String(error.code))
+        )
+          throw pathConflict(`${path} is a file and a folder at once`);
+        throw error;
+      }
     };
     const copies = Object.create(null) as Record<string, string>;
     for (const { path, reason } of plan.conflicts) {
@@ -291,10 +319,12 @@ export async function pullInto(options: {
       await fetchTo(path, copy);
       copies[path] = copy;
     }
-    for (const path of plan.write)
-      await fetchTo(path, await prepareTarget(directory, path));
+    // Removals first: on a case-insensitive disk a file Rosebud renamed by case
+    // is both removed and written, and the write must come last.
     for (const path of plan.remove)
       await unlink(await prepareTarget(directory, path));
+    for (const path of plan.write)
+      await fetchTo(path, await prepareTarget(directory, path));
     return {
       plan,
       skipped,

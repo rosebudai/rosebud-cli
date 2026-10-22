@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { watch } from "node:fs";
 import {
   mkdtemp,
   mkdir,
@@ -325,26 +326,30 @@ async function run(root, args) {
   };
 }
 /** Publish dist, connect and approve: the state a person reaches after claiming. */
-async function connected(t, game, files) {
+async function connected(t, game, files, { directory = "dist", state } = {}) {
   const root = await folder(
     t,
-    Object.fromEntries(Object.entries(files).map(([p, c]) => [`dist/${p}`, c])),
+    Object.fromEntries(
+      Object.entries(files).map(([p, c]) => [`${directory}/${p}`, c]),
+    ),
   );
+  const own = state ? ["--state", state] : [];
   assert.equal(
     (
       await run(root, [
         "publish",
         "--directory",
-        "dist",
+        directory,
         "--api-base",
         game.base,
+        ...own,
       ])
     ).code,
     0,
   );
-  assert.equal((await run(root, ["connect"])).code, 0);
+  assert.equal((await run(root, ["connect", ...own])).code, 0);
   game.access = "active";
-  assert.equal((await run(root, ["status"])).code, 0);
+  assert.equal((await run(root, ["status", ...own])).code, 0);
   return root;
 }
 const handle = async (root) =>
@@ -498,7 +503,27 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
     planPull(m({ a: "1", b: "2" }), m({ a: "9", c: "3" }), undefined).conflicts,
     [{ path: "a", reason: "both_changed" }],
   );
-  assert.deepEqual(planPull(remote, local, base, true).conflicts, []);
+  // --force settles conflicts for Rosebud, but leaves changes made only here alone.
+  assert.deepEqual(planPull(remote, local, base, true), {
+    write: ["both", "fresh", "remote"],
+    remove: ["gone", "goneEdited"],
+    conflicts: [],
+    localOnly: ["mine"],
+  });
+  assert.deepEqual(
+    planPull(
+      m({ x: "2", y: "1" }),
+      m({ y: "1", z: "1" }),
+      m({ x: "1", y: "1" }),
+      true,
+    ),
+    {
+      write: ["x"],
+      remove: [],
+      conflicts: [],
+      localOnly: ["z"],
+    },
+  );
   // A file deleted here and changed in Rosebud is a conflict too.
   assert.deepEqual(planPull(m({ x: "2" }), m({}), m({ x: "1" })).conflicts, [
     { path: "x", reason: "local_deleted" },
@@ -1041,3 +1066,242 @@ test(
     assert.doesNotMatch(pull.error.next_action, /\$|price|upgrade/i);
   },
 );
+
+test("pull --force settles conflicts for Rosebud but never touches changes made only here", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+    "old.js": "1",
+  });
+  await writeFile(join(root, "dist/index.html"), "mine");
+  await writeFile(join(root, "dist/game.js"), "edited here");
+  await rm(join(root, "dist/old.js"));
+  game.edit({ text: { "index.html": "rosie's" } });
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.equal(forced.code, 0, JSON.stringify(forced.error));
+  assert.equal(forced.data.status, "synced");
+  assert.deepEqual(forced.data.written, ["index.html"]);
+  assert.deepEqual(forced.data.removed, []);
+  assert.deepEqual(forced.data.local_only, []);
+  assert.equal(
+    await readFile(join(root, "dist/index.html"), "utf8"),
+    "rosie's",
+  );
+  assert.equal(
+    await readFile(join(root, "dist/game.js"), "utf8"),
+    "edited here",
+  );
+  await assert.rejects(readFile(join(root, "dist/old.js")));
+  // Both local-only changes still go up with the next update.
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(game.text.get("game.js"), "edited here");
+  assert.equal(game.text.has("old.js"), false);
+});
+
+test("pull --force removes a file Rosebud deleted that was edited here", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one", "b.js": "1" });
+  await writeFile(join(root, "dist/b.js"), "mine");
+  game.edit({ remove: ["b.js"] });
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.equal(forced.code, 0, JSON.stringify(forced.error));
+  assert.deepEqual(forced.data.removed, ["b.js"]);
+  await assert.rejects(readFile(join(root, "dist/b.js")));
+});
+
+test("next steps are copy-pasteable: they name --state and quote what needs it", async (t) => {
+  const game = await fakeRosebud(t);
+  const state = ".rosebud/b.json";
+  const root = await connected(
+    t,
+    game,
+    { "index.html": "one" },
+    { directory: "my game", state },
+  );
+  game.edit({ text: { "index.html": "two" } });
+  const synced = await run(root, [
+    "pull",
+    "--directory",
+    "my game",
+    "--state",
+    state,
+  ]);
+  assert.equal(synced.code, 0, JSON.stringify(synced.error));
+  assert.match(
+    synced.data.next_action,
+    /rosebud update --directory (['"])my game\1 --state \.rosebud\/b\.json\./,
+  );
+  await writeFile(join(root, "my game/index.html"), "mine");
+  game.edit({ text: { "index.html": "rosie's" } });
+  const conflicted = await run(root, [
+    "pull",
+    "--directory",
+    "my game",
+    "--state",
+    state,
+  ]);
+  const action = conflicted.data.next_action;
+  assert.match(
+    action,
+    new RegExp(
+      `rosebud update --directory (['"])my game\\1 --state \\.rosebud/b\\.json --expected-version ${conflicted.data.content_version}`,
+    ),
+  );
+  assert.match(
+    action,
+    /rosebud pull --directory (['"])my game\1 --state \.rosebud\/b\.json --force/,
+  );
+  // The default state needs no flag.
+  const plain = await connected(t, game, { "index.html": "x" });
+  const unflagged = await run(plain, ["pull", "--directory", "dist"]);
+  assert.match(unflagged.data.next_action, /rosebud update --directory dist\./);
+  assert.doesNotMatch(unflagged.data.next_action, /--state/);
+});
+
+test("the folder's own leftovers are not game files: hidden entries and old .part files", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/.DS_Store"), "junk");
+  await mkdir(join(root, "dist/.git"));
+  await writeFile(join(root, "dist/.git/config"), "junk");
+  await writeFile(join(root, `dist/index.html.${randomUUID()}.part`), "half");
+  await writeFile(join(root, "dist/mine.js"), "x");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.local_only, ["mine.js"]);
+});
+
+test("pull leaves no temporary file in the folder, even while it works", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  game.edit({
+    text: { "index.html": "two", "more.js": "x" },
+    media: { "assets/hero.png": Buffer.concat([png, png]) },
+  });
+  const seen = new Set();
+  const watcher = watch(
+    join(root, "dist"),
+    { recursive: true },
+    (_event, name) => name && seen.add(String(name)),
+  );
+  try {
+    const pull = await run(root, ["pull", "--directory", "dist"]);
+    assert.equal(pull.code, 0, JSON.stringify(pull.error));
+    // File events arrive a little late; wait for the last file, up to two seconds.
+    for (let wait = 0; wait < 40 && !seen.has("more.js"); wait += 1)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    watcher.close();
+  }
+  assert.ok(seen.has("more.js"), "the watcher saw the writes");
+  assert.deepEqual(
+    [...seen].filter((name) => name.endsWith(".part")),
+    [],
+  );
+});
+
+test("a file where a folder is needed, or the reverse, is path_conflict and names the path", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "a/x.js": "1",
+  });
+  // Rosebud replaced the folder a/ with a file a, so a/x.js is deleted there.
+  game.edit({ remove: ["a/x.js"], text: { a: "now a file" } });
+  const before = await handle(root);
+  const emptied = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(emptied.code, 2);
+  assert.equal(emptied.error.code, "path_conflict");
+  assert.match(emptied.error.message, /\ba\b/);
+  // Removals run first, so the old file is gone and a rerun after rmdir finishes.
+  await assert.rejects(readFile(join(root, "dist/a/x.js")));
+  assert.deepEqual(await handle(root), before);
+  await rm(join(root, "dist/a"), { recursive: true });
+  const rerun = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(await readFile(join(root, "dist/a"), "utf8"), "now a file");
+  // A folder that still holds a file of ours is a real clash.
+  game.edit({ remove: ["a"], text: { "b/c.js": "1" } });
+  assert.equal((await run(root, ["pull", "--directory", "dist"])).code, 0);
+  game.edit({ remove: ["b/c.js"], text: { b: "file" } });
+  await writeFile(join(root, "dist/b/mine.js"), "local only");
+  const clash = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(clash.error.code, "path_conflict");
+  assert.equal(
+    await readFile(join(root, "dist/b/mine.js"), "utf8"),
+    "local only",
+  );
+  // And the other way round: a folder is needed where a file stands.
+  game.edit({ remove: ["b"], text: { "index.html/x.js": "x" } });
+  const reverse = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(reverse.error.code, "path_conflict");
+  assert.match(reverse.error.message, /index\.html/);
+});
+
+test("removals run before writes, so a name that changes only in case survives", async (t) => {
+  const probe = await folder(t, { A: "x" });
+  const insensitive = await readFile(join(probe, "a")).then(
+    () => true,
+    () => false,
+  );
+  if (!insensitive) return t.skip("this file system is case-sensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one", "Foo.js": "1" });
+  game.edit({ remove: ["Foo.js"], text: { "foo.js": "2" } });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
+    "foo.js",
+    "index.html",
+  ]);
+  assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
+});
+
+test("conflict advice fits the conflicts, and skipped files are mentioned there too", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "gone.js": "1",
+    "edited.js": "1",
+  });
+  // Only a file Rosebud deleted: no copy exists, so none is named.
+  await writeFile(join(root, "dist/gone.js"), "mine");
+  game.edit({ remove: ["gone.js"], text: { "../skipped.js": "x" } });
+  const deleted = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(deleted.data.status, "conflicts");
+  assert.match(deleted.data.next_action, /has no copy/);
+  assert.doesNotMatch(
+    deleted.data.next_action,
+    /project\.remote|copies are in/,
+  );
+  assert.doesNotMatch(deleted.data.next_action, /Merge each/);
+  assert.match(deleted.data.next_action, /skipped/);
+  // A file deleted here and changed in Rosebud has a copy and its own advice.
+  await rm(join(root, "dist/edited.js"));
+  game.edit({ text: { "edited.js": "2" } });
+  const local = await run(root, ["pull", "--directory", "dist"]);
+  assert.match(local.data.next_action, /project\.remote/);
+  assert.match(
+    local.data.next_action,
+    /restore it from Rosebud's copy or leave it deleted/,
+  );
+});
+
+test("a path Rosebud lists twice is reported as duplicate_path, without the removal warning", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.edit({ text: { "twice.js": "text" }, media: { "twice.js": png } });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.skipped, [
+    { path: "twice.js", reason: "duplicate_path" },
+  ]);
+  assert.equal(await readFile(join(root, "dist/twice.js"), "utf8"), "text");
+  assert.doesNotMatch(pull.data.next_action, /removes them from the game/);
+  assert.match(pull.data.next_action, /twice/);
+});

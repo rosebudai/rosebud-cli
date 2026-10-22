@@ -24,6 +24,7 @@ import type {
 } from "./index.js";
 import { inputError, isObject } from "./errors.js";
 import { pullInto } from "./sync.js";
+import type { PullPlan, SkipReason } from "./sync.js";
 import {
   accountPath,
   assetRequestPath,
@@ -151,6 +152,62 @@ function remember(handle: ProjectHandle, release: PreparedRelease): void {
     delete handle.files;
     delete handle.media;
   }
+}
+/** An argument that can be pasted into a shell as one word. */
+function shellArg(arg: string): string {
+  if (/^[\w@+=:,./-]+$/.test(arg)) return arg;
+  return process.platform === "win32"
+    ? `"${arg}"`
+    : `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+/** What to do after a pull, with commands that target this game and can be pasted as they are. */
+function pullAdvice(options: {
+  directory: string;
+  state: string | undefined;
+  conflicts: PullPlan["conflicts"];
+  skipped: { path: string; reason: SkipReason }[];
+  remoteCopies: string;
+  version: string;
+}): string {
+  const { directory, state, conflicts, skipped, version } = options;
+  const flags = `--directory ${shellArg(directory)}${state === undefined ? "" : ` --state ${shellArg(state)}`}`;
+  const has = (reason: PullPlan["conflicts"][number]["reason"]) =>
+    conflicts.some((c) => c.reason === reason);
+  const notes: string[] = [];
+  if (skipped.some((s) => s.reason === "unsafe_path"))
+    notes.push(
+      "Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first.",
+    );
+  if (skipped.some((s) => s.reason === "duplicate_path"))
+    notes.push(
+      "Rosebud lists some paths twice (duplicate_path); the first copy of each was kept.",
+    );
+  const steps =
+    conflicts.length === 0
+      ? [
+          `${directory} now holds Rosebud's current version. Edit it, then run rosebud update ${flags}.`,
+        ]
+      : [
+          `These files changed both here and in Rosebud: ${conflicts.map((c) => c.path).join(", ")}.`,
+          ...(has("both_changed") || has("local_deleted")
+            ? [`Rosebud's copies are in ${options.remoteCopies}.`]
+            : []),
+          ...(has("both_changed")
+            ? ["Merge each into your file, keeping both changes."]
+            : []),
+          ...(has("local_deleted")
+            ? [
+                "A file you deleted that Rosebud changed: restore it from Rosebud's copy or leave it deleted.",
+              ]
+            : []),
+          ...(has("remote_deleted")
+            ? [
+                "A file Rosebud deleted has no copy: keep it to restore it, or delete it.",
+              ]
+            : []),
+          `Then run rosebud update ${flags} --expected-version ${version}. rosebud pull ${flags} --force takes Rosebud's version of these files instead.`,
+        ];
+  return [...steps, ...notes].join(" ");
 }
 /** A handle's manifest is plain data; anything else is corrupt or hand-edited. */
 function malformedManifest(handle: ProjectHandle): boolean {
@@ -513,7 +570,6 @@ async function main(): Promise<void> {
       // agent merges and names the version it merged against.
       if (conflicts.length === 0) handle.content_version = game.content_version;
       await saveState(statePath, handle);
-      const where = directory ?? "";
       output({
         project_id: handle.project_id,
         content_version: game.content_version,
@@ -528,10 +584,14 @@ async function main(): Promise<void> {
           rosebud_copy: pulled.copies[path] ?? null,
         })),
         skipped: pulled.skipped,
-        next_action:
-          conflicts.length > 0
-            ? `These files changed both here and in Rosebud: ${conflicts.map((c) => c.path).join(", ")}. Rosebud's copies are in ${remoteCopies}. Merge each into your file, keeping both changes (a file Rosebud deleted has no copy: keep it to restore it, or delete it), then run rosebud update --directory ${where} --expected-version ${game.content_version}. rosebud pull --force takes Rosebud's copies instead.`
-            : `${where} now holds Rosebud's current version. Edit it, then run rosebud update --directory ${where}.${pulled.skipped.length > 0 ? " Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first." : ""}`,
+        next_action: pullAdvice({
+          directory: directory ?? "",
+          state: value("state"),
+          conflicts,
+          skipped: pulled.skipped,
+          remoteCopies,
+          version: game.content_version,
+        }),
       });
       return;
     }
