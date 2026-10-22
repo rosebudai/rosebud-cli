@@ -365,33 +365,39 @@ async function localFiles(root: string): Promise<{
 /**
  * How the disk compares names, learned once per pull from a scratch file in
  * `scratch`, so nothing is ever created in the game's folder. macOS and Windows
- * disks fold letter case by default, and macOS also folds Unicode form (é as one
- * character or two). When `scratch` sits on another disk than the folder, the
+ * disks fold letter case by default, and macOS also folds Unicode form (an accented
+ * letter as one character or two). When `scratch` sits on another disk than the folder, the
  * answer can't speak for the folder, so both are folded: refusing a pair of names
  * the disk could have kept apart is safe, overwriting one with the other is not.
  */
-async function diskNames(
+export async function diskNames(
   directory: string,
   scratch: string,
 ): Promise<(path: string) => string> {
-  await mkdir(scratch, { recursive: true });
   let foldsCase = true,
     foldsForm = true;
-  if ((await lstat(directory)).dev === (await lstat(scratch)).dev) {
-    const id = randomUUID();
-    const probe = join(scratch, `${id}-Aé`);
-    await writeFile(probe, "", { flag: "wx" });
-    const found = (name: string) =>
-      lstat(join(scratch, name)).then(
-        () => true,
-        () => false,
-      );
-    try {
-      foldsCase = await found(`${id}-aé`);
-      foldsForm = await found(`${id}-Aé`);
-    } finally {
-      await unlink(probe);
+  try {
+    await mkdir(scratch, { recursive: true });
+    if ((await lstat(directory)).dev === (await lstat(scratch)).dev) {
+      const id = randomUUID();
+      // A capital A, then e and a combining acute accent: é in its decomposed (NFD) form.
+      const probe = join(scratch, `${id}-Ae\u0301`);
+      await writeFile(probe, "", { flag: "wx" });
+      const found = (name: string) =>
+        lstat(join(scratch, name)).then(
+          () => true,
+          () => false,
+        );
+      try {
+        foldsCase = await found(`${id}-ae\u0301`);
+        foldsForm = await found(`${id}-A\u00e9`);
+      } finally {
+        await unlink(probe);
+      }
     }
+  } catch {
+    // A disk that can't be asked is treated as folding both, the safe side.
+    foldsCase = foldsForm = true;
   }
   return (path) => {
     const form = foldsForm ? path.normalize("NFC") : path;

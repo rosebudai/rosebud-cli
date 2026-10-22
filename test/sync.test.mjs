@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { strToU8, zipSync } from "fflate";
 import { Rosebud, RosebudError, prepareRelease } from "../dist/index.js";
-import { planPull, safePath } from "../dist/sync.js";
+import { diskNames, planPull, safePath } from "../dist/sync.js";
 import { fakeRosebud, md5, AGENT, PROJECT } from "./fake-rosebud.mjs";
 
 async function folder(t, files) {
@@ -456,7 +456,19 @@ test("a lock left by a process that has gone is taken over, and a live one still
   // A lock that names no process can't be judged, so it stands too.
   await writeFile(lock, "");
   assert.equal((await run(root, ["status"])).error.code, "state_locked");
-  await rm(lock);
+  // A takeover killed part-way leaves its guard: stale with its process, live otherwise.
+  await writeFile(lock, `${gone.pid}\n`);
+  await writeFile(`${lock}.takeover`, `${process.pid}\n`);
+  assert.equal((await run(root, ["status"])).error.code, "state_locked");
+  await writeFile(`${lock}.takeover`, `${gone.pid}\n`);
+  const guarded = await run(root, ["status"]);
+  assert.equal(guarded.code, 0, JSON.stringify(guarded.error));
+  assert.deepEqual(
+    (await readdir(join(root, ".rosebud"))).filter((name) =>
+      name.startsWith("project.json."),
+    ),
+    [],
+  );
   assert.equal((await run(root, ["status"])).code, 0);
 });
 
@@ -468,21 +480,18 @@ test(
     const api = await rogueServer(t, () => undefined);
     const root = await folder(t, { "dist/index.html": "one" });
     const lock = join(root, ".rosebud/project.json.lock");
-    for (const [signal, exit] of [
-      ["SIGTERM", 143],
-      ["SIGINT", 130],
+    const publish = ["publish", "--directory", "dist", "--api-base", api.base];
+    for (const [signal, exit, args] of [
+      ["SIGTERM", 143, publish],
+      ["SIGINT", 130, publish],
+      // A command that holds no lock says nothing of one.
+      ["SIGTERM", 143, ["assets", "models", "--api-base", api.base]],
     ]) {
+      const locking = args === publish;
       const asked = api.requests.length;
       const child = spawn(
         process.execPath,
-        [
-          fileURLToPath(new URL("../dist/cli.js", import.meta.url)),
-          "publish",
-          "--directory",
-          "dist",
-          "--api-base",
-          api.base,
-        ],
+        [fileURLToPath(new URL("../dist/cli.js", import.meta.url)), ...args],
         {
           cwd: root,
           env: {
@@ -498,8 +507,12 @@ test(
       const closed = once(child, "close");
       for (let wait = 0; api.requests.length === asked && wait < 200; wait += 1)
         await new Promise((resolve) => setTimeout(resolve, 25));
-      assert.ok(api.requests.length > asked, "the publish reached Rosebud");
-      assert.ok((await readFile(lock, "utf8")).length > 0, "it holds the lock");
+      assert.ok(api.requests.length > asked, "the command reached Rosebud");
+      if (locking)
+        assert.ok(
+          (await readFile(lock, "utf8")).length > 0,
+          "it holds the lock",
+        );
       child.kill(signal);
       const [code] = await closed;
       assert.equal(code, exit, signal);
@@ -508,9 +521,82 @@ test(
       assert.equal(error.code, "interrupted");
       assert.equal(error.outcome, "unknown");
       assert.match(error.message, new RegExp(signal));
+      if (locking) assert.match(error.message, /lock was released/);
+      else assert.doesNotMatch(error.message, /lock/);
     }
   },
 );
+
+test(
+  "of many commands taking over one stale lock at once, only one holds it at a time",
+  { timeout: 120000 },
+  async (t) => {
+    const dir = await folder(t, {});
+    const state = join(dir, "project.json"),
+      log = join(dir, "log");
+    // Each contender holds the lock briefly and logs when it goes in and out.
+    const contender = `
+      import { appendFileSync } from "node:fs";
+      import { withStateLock } from ${JSON.stringify(new URL("../dist/state.js", import.meta.url).href)};
+      const [state, log] = process.argv.slice(1);
+      try {
+        await withStateLock(state, async () => {
+          appendFileSync(log, "in\\n");
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          appendFileSync(log, "out\\n");
+        });
+      } catch (error) {
+        appendFileSync(log, \`refused \${error.code}\\n\`);
+      }`;
+    for (let round = 0; round < 10; round += 1) {
+      const gone = spawn(process.execPath, ["-e", ""]);
+      await once(gone, "exit");
+      await writeFile(`${state}.lock`, `${gone.pid}\n`);
+      await writeFile(log, "");
+      await Promise.all(
+        Array.from({ length: 8 }, async () => {
+          const child = spawn(
+            process.execPath,
+            ["--input-type=module", "-e", contender, state, log],
+            { stdio: "ignore" },
+          );
+          await once(child, "exit");
+        }),
+      );
+      const lines = (await readFile(log, "utf8")).trim().split("\n");
+      let inside = 0,
+        most = 0;
+      for (const line of lines) {
+        inside += line === "in" ? 1 : line === "out" ? -1 : 0;
+        most = Math.max(most, inside);
+      }
+      assert.equal(most, 1, `round ${round}: ${lines.join(", ")}`);
+      assert.ok(
+        lines.every((line) => /^(in|out|refused state_locked)$/.test(line)),
+        lines.join(", "),
+      );
+      // Nothing is left behind: no lock, guard or moved-aside file.
+      assert.deepEqual(await readdir(dir), ["log"], `round ${round}`);
+    }
+  },
+);
+
+test("a lock naming this very process, which doesn't hold it, is stale", async (t) => {
+  const { withStateLock } = await import("../dist/state.js");
+  const dir = await folder(t, {});
+  const state = join(dir, "project.json");
+  // A process id from an earlier boot, reused by this one.
+  await writeFile(`${state}.lock`, `${process.pid}\n`);
+  assert.equal(await withStateLock(state, async () => "held"), "held");
+  await assert.rejects(readFile(`${state}.lock`));
+  // Within a command that holds it, the lock still refuses a second claim.
+  await withStateLock(state, () =>
+    assert.rejects(
+      withStateLock(state, async () => undefined),
+      (error) => error.code === "state_locked",
+    ),
+  );
+});
 
 test("an .svg outside assets/ is a text file, and a path Rosebud holds as text stays text on update", async (t) => {
   const game = await fakeRosebud(t);
@@ -847,6 +933,21 @@ test("planPull matches names the way the disk does, and refuses Rosebud names th
   ]);
   assert.deepEqual([moved.write, moved.remove], [[], []]);
 });
+
+test(
+  "when the disk can't be probed, names are folded both ways rather than the pull failing",
+  // Windows has no read-only folders, and root writes anywhere.
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  async (t) => {
+    const root = await folder(t, { "game/index.html": "x" });
+    const scratch = join(root, "scratch");
+    // Empty, so the test's cleanup can still remove it.
+    await mkdir(scratch, { mode: 0o500 });
+    const fold = await diskNames(join(root, "game"), scratch);
+    assert.equal(fold("Foo.js"), fold("foo.js"));
+    assert.equal(fold("cafe\u0301.js"), fold("caf\u00e9.js"));
+  },
+);
 
 test("safePath refuses names Windows would change or treat as devices, there only", () => {
   for (const name of [

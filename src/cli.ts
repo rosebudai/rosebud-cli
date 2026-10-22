@@ -1492,9 +1492,9 @@ for (const [signal, code] of [
   ["SIGTERM", 143],
 ] as const)
   process.on(signal, () => {
-    releaseLocks();
+    const released = releaseLocks() > 0 ? "; its state lock was released" : "";
     process.stderr.write(
-      `${JSON.stringify({ error: { kind: "transport", code: "interrupted", message: `Stopped by ${signal} before finishing; its state lock was released. Run the same command again to finish, except publish: an interrupted publish may already have created the game, so don't publish again automatically.`, outcome: "unknown" } })}\n`,
+      `${JSON.stringify({ error: { kind: "transport", code: "interrupted", message: `Stopped by ${signal} before finishing${released}. Run the same command again to finish, except publish: an interrupted publish may already have created the game, so don't publish again automatically.`, outcome: "unknown" } })}\n`,
     );
     process.exit(code);
   });
