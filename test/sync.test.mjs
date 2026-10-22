@@ -3,14 +3,13 @@ import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { watch } from "node:fs";
+import { realpathSync, watch } from "node:fs";
 import {
   utimes,
   mkdtemp,
   mkdir,
   readFile,
   readdir,
-  realpath,
   rm,
   symlink,
   writeFile,
@@ -23,6 +22,13 @@ import { strToU8, zipSync } from "fflate";
 import { Rosebud, RosebudError, prepareRelease } from "../dist/index.js";
 import { diskNames, planPull, safePath } from "../dist/sync.js";
 import { fakeRosebud, md5, AGENT, PROJECT } from "./fake-rosebud.mjs";
+
+/**
+ * An existing path as the disk names it, links resolved. On Windows that is the
+ * long form: a temporary folder may be spelled C:\Users\RUNNER~1\… while the
+ * CLI, working from that folder, reports C:\Users\runneradmin\….
+ */
+const onDisk = (path) => realpathSync.native(path);
 
 async function folder(t, files) {
   const root = await mkdtemp(join(tmpdir(), "rosebud-sync-test-"));
@@ -1181,7 +1187,10 @@ test("pull into another folder than the last sync's writes every file there", as
   assert.deepEqual(pull.data.local_only, ["notes.txt"]);
   assert.deepEqual(pull.data.missing_locally, []);
   assert.match(pull.data.directory, /game$/);
-  assert.equal((await handle(root)).directory, pull.data.directory);
+  assert.equal(
+    onDisk((await handle(root)).directory),
+    onDisk(pull.data.directory),
+  );
   // Back in the first folder, its files are compared without that other sync.
   await rm(join(root, "dist/game.js"));
   const back = await run(root, ["pull", "--directory", "dist"]);
@@ -1273,8 +1282,8 @@ test("pull keeps conflicting local edits, saves Rosebud's copy beside the state,
   assert.ok(!("clashes_with" in pull.data.conflicts[0]));
   // Beside the state file, so never inside the folder that update uploads.
   assert.equal(
-    await realpath(dirname(copy)),
-    join(await realpath(root), ".rosebud", "project.remote"),
+    onDisk(dirname(copy)),
+    onDisk(join(root, ".rosebud", "project.remote")),
   );
   assert.equal(pull.data.content_version, game.version);
   assert.equal((await handle(root)).content_version, published);
@@ -2656,12 +2665,12 @@ test("a case-only rename never overwrites a local file that stays: it is a case_
   assert.equal(pull.code, 0, JSON.stringify(pull.error));
   assert.equal(pull.data.status, "conflicts");
   assert.deepEqual(pull.data.written, []);
-  const copy = join(await realpath(root), ".rosebud/project.remote/foo.js");
+  const copy = onDisk(join(root, ".rosebud/project.remote/foo.js"));
   assert.deepEqual(
     pull.data.conflicts.map(({ path, reason, rosebud_copy, clashes_with }) => [
       path,
       reason,
-      rosebud_copy && join(rosebud_copy),
+      rosebud_copy && onDisk(rosebud_copy),
       clashes_with,
     ]),
     [["foo.js", "case_conflict", copy, "Foo.js"]],

@@ -1443,7 +1443,8 @@ function byteLimit(value: JsonValue | undefined): number | undefined {
 }
 /**
  * The files an update conflict names: null when Rosebud can't tell, else a bounded
- * list. Rosebud names the paths before and after, so a rewritten game lists each twice.
+ * list. Rosebud names each changed path once, from both versions' files, so the
+ * list is at most twice the per-game file limit.
  */
 function pathList(value: JsonValue | undefined): string[] | null | undefined {
   if (value === null) return null;
