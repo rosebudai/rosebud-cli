@@ -614,21 +614,25 @@ test("rejected uploads report the server's filename and limit but nothing else f
   }
 });
 
-test("an upload_retry wait is capped at ten seconds, whatever Retry-After says", async (t) => {
-  const game = await fakeRosebud(t, {
-    uploadRetries: 1,
-    uploadRetryAfter: 3600,
-  });
-  const root = await directory(t, {
-    "index.html": "x",
-    "assets/hero.png": Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-  });
-  const started = Date.now();
-  await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
-  const waited = Date.now() - started;
-  assert.ok(waited >= 9500 && waited < 20000, `waited ${waited} ms`);
-  assert.equal(game.uploadRetries, 0);
-});
+test(
+  "an upload_retry wait is capped at ten seconds, whatever Retry-After says",
+  { timeout: 30000 },
+  async (t) => {
+    const game = await fakeRosebud(t, {
+      uploadRetries: 1,
+      uploadRetryAfter: 3600,
+    });
+    const root = await directory(t, {
+      "index.html": "x",
+      "assets/hero.png": Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    });
+    const started = Date.now();
+    await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+    const waited = Date.now() - started;
+    assert.ok(waited >= 9500 && waited < 20000, `waited ${waited} ms`);
+    assert.equal(game.uploadRetries, 0);
+  },
+);
 
 test("credentials only travel over HTTPS, except to a local server", () => {
   assert.throws(

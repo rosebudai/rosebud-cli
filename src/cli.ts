@@ -203,14 +203,23 @@ function pullAdvice(options: {
     notes.push(
       "Rosebud lists some paths twice (duplicate_path); the first copy of each was kept.",
     );
+  // A case clash is not an edit on both sides, so it gets its own words.
+  const clashes = conflicts.filter((c) => c.reason === "case_conflict");
+  const edits = conflicts.filter((c) => c.reason !== "case_conflict");
   const steps =
     conflicts.length === 0
       ? [
           `${directory} now holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`,
         ]
       : [
-          `These files changed both here and in Rosebud: ${conflicts.map((c) => quoted(c.path)).join(", ")}.`,
-          ...(has("both_changed") || has("local_deleted")
+          ...(edits.length > 0
+            ? [
+                `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`,
+              ]
+            : []),
+          ...(has("both_changed") ||
+          has("local_deleted") ||
+          has("case_conflict")
             ? [`Rosebud's copies are in ${quoted(options.remoteCopies)}.`]
             : []),
           ...(has("both_changed")
@@ -226,7 +235,12 @@ function pullAdvice(options: {
                 "A file Rosebud deleted has no copy: keep it to restore it, or delete it.",
               ]
             : []),
-          `Then run \`rosebud update ${flags} --expected-version ${version}\`. \`rosebud pull ${flags} --force\` takes Rosebud's version of these files instead.`,
+          ...(clashes.length > 0
+            ? [
+                `This disk treats names that differ only by letter case as one file, so pull did not write ${clashes.map((c) => `Rosebud's ${quoted(c.path)} over your ${quoted(c.clashesWith ?? c.path)}`).join(", ")}. Rename each of your files to Rosebud's name and merge Rosebud's copy into it, keeping both changes.`,
+              ]
+            : []),
+          `Then run \`rosebud update ${flags} --expected-version ${version}\`.${edits.length > 0 ? ` \`rosebud pull ${flags} --force\` takes Rosebud's version of these files instead.` : ""}`,
         ];
   return [...steps, ...notes].join(" ");
 }

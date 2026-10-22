@@ -18,7 +18,11 @@ import { inputError, RosebudError } from "./errors.js";
 import type { GameFiles, Rosebud } from "./index.js";
 
 export type ConflictReason =
-  "both_changed" | "local_deleted" | "remote_deleted";
+  | "both_changed"
+  | "local_deleted"
+  | "remote_deleted"
+  /** Rosebud's name differs only by letter case from a local file that stays, on a disk that treats them as one. */
+  | "case_conflict";
 /** Why a path Rosebud holds was not brought in; a duplicate keeps its first copy. */
 export type SkipReason = "unsafe_path" | "duplicate_path";
 export interface PullPlan {
@@ -27,7 +31,12 @@ export interface PullPlan {
   /** Local files Rosebud deleted, unchanged here since the last sync. */
   remove: string[];
   /** Changed on both sides; the local copy stays. */
-  conflicts: { path: string; reason: ConflictReason }[];
+  conflicts: {
+    path: string;
+    reason: ConflictReason;
+    /** For a case_conflict: the local path whose name differs only by letter case. */
+    clashesWith?: string;
+  }[];
   /** Files Rosebud never had; they stay and go up with the next update. */
   localOnly: string[];
 }
@@ -158,6 +167,46 @@ async function localFiles(root: string): Promise<Map<string, string>> {
   }
   await walk("");
   return found;
+}
+
+/**
+ * On a case-insensitive disk (macOS and Windows by default) writing `foo.js` would
+ * replace a local `Foo.js` that stays, so such writes become case_conflict conflicts
+ * and nothing local is lost. Asking the disk about the exact target, only when a
+ * name clashes, needs no probe file and is right even for per-folder case rules.
+ * A file this pull removes is no rival: Rosebud's rename by case just goes through.
+ */
+async function protectCaseRenames(
+  directory: string,
+  plan: PullPlan,
+  local: ReadonlyMap<string, string>,
+): Promise<void> {
+  const removing = new Set(plan.remove);
+  const staying = new Map<string, string>();
+  for (const path of local.keys())
+    if (!removing.has(path)) staying.set(path.toLowerCase(), path);
+  const kept: string[] = [];
+  for (const path of plan.write) {
+    const rival = staying.get(path.toLowerCase());
+    if (
+      rival !== undefined &&
+      !local.has(path) &&
+      (await lstat(join(directory, ...path.split("/"))).then(
+        () => true,
+        () => false,
+      ))
+    )
+      plan.conflicts.push({
+        path,
+        reason: "case_conflict",
+        clashesWith: rival,
+      });
+    else kept.push(path);
+  }
+  plan.write = kept;
+  plan.conflicts.sort((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+  );
 }
 
 /** The target's folders exist and none is a link, so a write lands inside `root`. */
@@ -294,6 +343,7 @@ export async function pullInto(options: {
       options.base ? new Map(Object.entries(options.base)) : undefined,
       options.force,
     );
+    await protectCaseRenames(directory, plan, local);
     const fetchTo = async (path: string, target: string) => {
       const text = texts.get(path);
       let from: string;

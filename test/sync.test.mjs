@@ -1287,7 +1287,7 @@ async function pendingOperation(root) {
 test("a busy Rosebud refused the update unapplied: it is a plain rejection, so the next update may change anything", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, { "index.html": "one" });
-  const busy429 = (retryAfter) =>
+  const injectBusy = (retryAfter) =>
     game.inject.push({
       path: "/releases/",
       status: 503,
@@ -1297,7 +1297,7 @@ test("a busy Rosebud refused the update unapplied: it is a plain rejection, so t
       error: { code: "busy" },
     });
   await writeFile(join(root, "dist/index.html"), "two");
-  busy429("7");
+  injectBusy("7");
   const busy = await run(root, ["update", "--directory", "dist"]);
   assert.equal(busy.code, 3);
   assert.equal(busy.error.kind, "api");
@@ -1318,7 +1318,7 @@ test("a busy Rosebud refused the update unapplied: it is a plain rejection, so t
   assert.equal(game.text.get("index.html"), "three");
   // Busy, then a Rosebud edit: pull brings it in and update carries on.
   await writeFile(join(root, "dist/index.html"), "four");
-  busy429("1");
+  injectBusy("1");
   assert.equal(
     (await run(root, ["update", "--directory", "dist"])).error.next_action,
     "Rosebud is busy. Run the same command again in 1 second; nothing was changed.",
@@ -1333,7 +1333,7 @@ test("a busy Rosebud refused the update unapplied: it is a plain rejection, so t
   assert.equal(game.text.get("AGENTS.md"), "rosie's notes");
   // Without a usable Retry-After there is nothing to count.
   for (const retryAfter of [undefined, "0"]) {
-    busy429(retryAfter);
+    injectBusy(retryAfter);
     const soon = await run(root, ["update", "--directory", "dist"]);
     assert.equal(
       soon.error.next_action,
@@ -1678,7 +1678,7 @@ test("a file where a folder is needed, or the reverse, is path_conflict and name
   const emptied = await run(root, ["pull", "--directory", "dist"]);
   assert.equal(emptied.code, 2);
   assert.equal(emptied.error.code, "path_conflict");
-  assert.match(emptied.error.message, /\ba\b/);
+  assert.match(emptied.error.message, /^a is a folder/);
   // Removals run first, so the old file is gone and a rerun after rmdir finishes.
   await assert.rejects(readFile(join(root, "dist/a/x.js")));
   assert.deepEqual(await handle(root), before);
@@ -1704,13 +1704,18 @@ test("a file where a folder is needed, or the reverse, is path_conflict and name
   assert.match(reverse.error.message, /index\.html/);
 });
 
-test("removals run before writes, so a name that changes only in case survives", async (t) => {
+// macOS and Windows disks treat Foo.js and foo.js as one file; Linux ones don't.
+async function caseInsensitiveDisk(t) {
   const probe = await folder(t, { A: "x" });
-  const insensitive = await readFile(join(probe, "a")).then(
+  return readFile(join(probe, "a")).then(
     () => true,
     () => false,
   );
-  if (!insensitive) return t.skip("this file system is case-sensitive");
+}
+
+test("removals run before writes, so a name that changes only in case survives", async (t) => {
+  if (!(await caseInsensitiveDisk(t)))
+    return t.skip("this file system is case-sensitive");
   const game = await fakeRosebud(t);
   const root = await connected(t, game, { "index.html": "one", "Foo.js": "1" });
   game.edit({ remove: ["Foo.js"], text: { "foo.js": "2" } });
@@ -1720,6 +1725,135 @@ test("removals run before writes, so a name that changes only in case survives",
     "foo.js",
     "index.html",
   ]);
+  assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
+});
+
+test("a case-only rename never overwrites a local file that stays: it is a case_conflict with Rosebud's copy saved aside", async (t) => {
+  if (!(await caseInsensitiveDisk(t)))
+    return t.skip("this file system is case-sensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one", "Foo.js": "1" });
+  await writeFile(join(root, "dist/Foo.js"), "mine");
+  game.edit({ remove: ["Foo.js"], text: { "foo.js": "2" } });
+  const before = await handle(root);
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "conflicts");
+  assert.deepEqual(pull.data.written, []);
+  const copy = join(await realpath(root), ".rosebud/project.remote/foo.js");
+  assert.deepEqual(
+    pull.data.conflicts.map(({ path, reason, rosebud_copy }) => [
+      path,
+      reason,
+      rosebud_copy && join(rosebud_copy),
+    ]),
+    [
+      ["Foo.js", "remote_deleted", null],
+      ["foo.js", "case_conflict", copy],
+    ],
+  );
+  // The local edit is untouched, under its own name; Rosebud's copy is beside it.
+  assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
+    "Foo.js",
+    "index.html",
+  ]);
+  assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
+  assert.equal(await readFile(copy, "utf8"), "2");
+  assert.match(pull.data.next_action, /letter case/);
+  assert.match(pull.data.next_action, /`foo\.js`/);
+  assert.match(pull.data.next_action, /`Foo\.js`/);
+  assert.match(pull.data.next_action, /project\.remote/);
+  // Nothing moved: the saved version and manifest still describe the last sync.
+  const after = await handle(root);
+  assert.equal(after.content_version, before.content_version);
+  assert.deepEqual(after.files, before.files);
+  // Pulling again says the same, and the folder is still untouched.
+  const again = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(
+    again.data.conflicts.map((c) => [c.path, c.reason]),
+    [
+      ["Foo.js", "remote_deleted"],
+      ["foo.js", "case_conflict"],
+    ],
+  );
+  assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
+  // --force takes Rosebud's version: the old name goes first, so the new one can be written.
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.equal(forced.code, 0, JSON.stringify(forced.error));
+  assert.equal(forced.data.status, "synced");
+  assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
+    "foo.js",
+    "index.html",
+  ]);
+  assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
+});
+
+test("a file Rosebud adds that differs only in case from a file that exists only here is a case_conflict, even with --force", async (t) => {
+  if (!(await caseInsensitiveDisk(t)))
+    return t.skip("this file system is case-sensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/README.md"), "mine");
+  game.edit({
+    text: { "readme.md": "rosie's", "Assets/Lib/B.js": "b" },
+    media: { "Hero.PNG": png },
+  });
+  await mkdir(join(root, "dist/assets/lib"), { recursive: true });
+  await writeFile(join(root, "dist/assets/lib/b.js"), "mine too");
+  await writeFile(join(root, "dist/hero.png"), "mine three");
+  for (const args of [[], ["--force"]]) {
+    const pull = await run(root, ["pull", "--directory", "dist", ...args]);
+    assert.equal(pull.code, 0, JSON.stringify(pull.error));
+    assert.deepEqual(
+      pull.data.conflicts.map((c) => [c.path, c.reason]),
+      [
+        ["Assets/Lib/B.js", "case_conflict"],
+        ["Hero.PNG", "case_conflict"],
+        ["readme.md", "case_conflict"],
+      ],
+      args.join(" "),
+    );
+    assert.deepEqual(pull.data.local_only.sort(), [
+      "README.md",
+      "assets/lib/b.js",
+      "hero.png",
+    ]);
+    assert.equal(await readFile(join(root, "dist/README.md"), "utf8"), "mine");
+    assert.equal(
+      await readFile(join(root, "dist/assets/lib/b.js"), "utf8"),
+      "mine too",
+    );
+    assert.equal(
+      await readFile(join(root, "dist/hero.png"), "utf8"),
+      "mine three",
+    );
+    // Rosebud's copies, media included, wait in the .remote folder.
+    assert.equal(
+      await readFile(join(root, ".rosebud/project.remote/readme.md"), "utf8"),
+      "rosie's",
+    );
+    assert.deepEqual(
+      await readFile(join(root, ".rosebud/project.remote/Hero.PNG")),
+      png,
+    );
+  }
+});
+
+test("on a case-sensitive disk, names that differ only in case are different files and no conflict is made", async (t) => {
+  if (await caseInsensitiveDisk(t))
+    return t.skip("this file system is case-insensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one", "Foo.js": "1" });
+  await writeFile(join(root, "dist/Foo.js"), "mine");
+  game.edit({ remove: ["Foo.js"], text: { "foo.js": "2" } });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(
+    pull.data.conflicts.map((c) => [c.path, c.reason]),
+    [["Foo.js", "remote_deleted"]],
+  );
+  assert.deepEqual(pull.data.written, ["foo.js"]);
+  assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
   assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
 });
 
