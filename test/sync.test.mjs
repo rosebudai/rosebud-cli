@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { strToU8, zipSync } from "fflate";
 import { Rosebud, RosebudError, prepareRelease } from "../dist/index.js";
 import { fakeRosebud, md5, AGENT, PROJECT } from "./fake-rosebud.mjs";
 
@@ -284,4 +287,158 @@ test("a game with too many files for the one-ZIP fallback is told the old server
       !/10 MiB/.test(e.message),
   );
   assert.equal(game.releases, 0);
+});
+
+async function run(root, args) {
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("../dist/cli.js", import.meta.url)), ...args],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        ROSEBUD_API_BASE: "",
+        ROSEBUD_CREDENTIALS_DIR: join(root, "credentials"),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stdout = "",
+    stderr = "";
+  child.stdout.on("data", (b) => (stdout += b));
+  child.stderr.on("data", (b) => (stderr += b));
+  const [code] = await once(child, "close");
+  return {
+    code,
+    data: stdout ? JSON.parse(stdout) : undefined,
+    error: stderr ? JSON.parse(stderr).error : undefined,
+  };
+}
+/** Publish dist, connect and approve: the state a person reaches after claiming. */
+async function connected(t, game, files) {
+  const root = await folder(
+    t,
+    Object.fromEntries(Object.entries(files).map(([p, c]) => [`dist/${p}`, c])),
+  );
+  assert.equal(
+    (
+      await run(root, [
+        "publish",
+        "--directory",
+        "dist",
+        "--api-base",
+        game.base,
+      ])
+    ).code,
+    0,
+  );
+  assert.equal((await run(root, ["connect"])).code, 0);
+  game.access = "active";
+  assert.equal((await run(root, ["status"])).code, 0);
+  return root;
+}
+const handle = async (root) =>
+  JSON.parse(await readFile(join(root, ".rosebud/project.json"), "utf8"));
+
+test("publish and update record every file they sent", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  assert.deepEqual((await handle(root)).files, {
+    "index.html": md5(Buffer.from("one")),
+    "assets/hero.png": md5(png),
+  });
+  assert.deepEqual((await handle(root)).media, ["assets/hero.png"]);
+  await writeFile(join(root, "dist/index.html"), "two");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(
+    (await handle(root)).files["index.html"],
+    md5(Buffer.from("two")),
+  );
+  assert.deepEqual(game.puts, ["assets/hero.png"]); // the update linked it
+});
+
+test("a rerun after a lost response replays the release without uploading again", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/big.bin": big,
+  });
+  await writeFile(
+    join(root, "dist/assets/big.bin"),
+    Buffer.alloc(big.length, 9),
+  );
+  game.loseNextRelease = true;
+  const lost = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(lost.code, 4);
+  const puts = game.puts.length,
+    releases = game.releases;
+  const rerun = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(game.puts.length, puts); // linked: the game already serves it
+  assert.equal(game.releases, releases); // replayed, not released twice
+  assert.equal(rerun.data.content_version, game.version);
+});
+
+test("a handle from 0.1.0, without files or media, still updates and gains them", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  const old = await handle(root);
+  delete old.files;
+  delete old.media;
+  await writeFile(join(root, ".rosebud/project.json"), JSON.stringify(old), {
+    mode: 0o600,
+  });
+  await writeFile(join(root, "dist/index.html"), "two");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual((await handle(root)).media, ["assets/hero.png"]);
+  assert.equal(
+    (await handle(root)).files["index.html"],
+    md5(Buffer.from("two")),
+  );
+});
+
+test("an update from a ZIP clears what the handle knew of the files", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  assert.ok((await handle(root)).files);
+  await writeFile(
+    join(root, "game.zip"),
+    zipSync({ "index.html": strToU8("two") }),
+  );
+  const update = await run(root, ["update", "--zip", "game.zip"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  const after = await handle(root);
+  assert.equal(after.files, undefined);
+  assert.equal(after.media, undefined);
+  assert.equal(after.content_version, game.version);
+});
+
+test("after a lost response, a changed media file is different input, not a rerun", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  await writeFile(
+    join(root, "dist/assets/hero.png"),
+    Buffer.concat([png, png]),
+  );
+  game.loseNextRelease = true;
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+  // The text ZIP is the same; only the media manifest differs.
+  await writeFile(
+    join(root, "dist/assets/hero.png"),
+    Buffer.concat([png, png, png]),
+  );
+  const changed = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(changed.code, 2);
+  assert.equal(changed.error.code, "pending_operation");
 });

@@ -5,7 +5,8 @@ import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { prepareBundle } from "./bundle.js";
+import { prepareRelease } from "./bundle.js";
+import type { PreparedRelease } from "./bundle.js";
 import {
   Rosebud,
   RosebudError,
@@ -138,6 +139,17 @@ const assetCommands: Record<string, number> = {
   list: 2,
   download: 3,
 };
+/** What Rosebud now holds, so a later pull can tell local edits from Rosebud's. */
+function remember(handle: ProjectHandle, release: PreparedRelease): void {
+  if (release.files && release.mediaPaths) {
+    handle.files = release.files;
+    handle.media = release.mediaPaths;
+  } else {
+    // A ZIP the CLI didn't build: unknown contents, so a pull compares everything.
+    delete handle.files;
+    delete handle.media;
+  }
+}
 /** Ids that help recover from an error, added to its JSON. */
 const errorContext: { job_id?: string; asset_id?: string } = {};
 
@@ -281,8 +293,10 @@ async function main(): Promise<void> {
         accountPath(api.apiBaseUrl),
         api.apiBaseUrl,
       );
+      const release = await prepareRelease(input, { splitMedia: true });
       const result = await api.publish({
         ...input,
+        prepared: release,
         ...metadata,
         ...(login ? { token: login.token } : {}),
         context: {
@@ -303,6 +317,7 @@ async function main(): Promise<void> {
       };
       if (!publishedToAccount(result))
         handle.claim_expires_at = result.claim_expires_at;
+      remember(handle, release);
       const path = credentialPath(statePath, handle);
       outsideBuild(path, directory);
       await prepareCredentials(path);
@@ -462,12 +477,17 @@ async function main(): Promise<void> {
         "version_required",
         "Run status after approval to establish this connection's initial version.",
       );
-    const bytes = await prepareBundle(input);
+    const knownMedia = new Set(handle.media ?? []);
+    const release = await prepareRelease(input, {
+      splitMedia: true,
+      knownMedia,
+    });
     const cover = metadata.thumbnail
       ? await readCover(metadata.thumbnail)
       : undefined;
     const fingerprint = createHash("sha256")
-      .update(bytes)
+      .update(release.zip)
+      .update(JSON.stringify(release.media.map((m) => [m.path, m.md5])))
       .update(
         JSON.stringify({
           ...metadata,
@@ -502,6 +522,8 @@ async function main(): Promise<void> {
       const result = await api.update({
         ...input,
         ...metadata,
+        prepared: release,
+        knownMedia,
         projectId: handle.project_id,
         agentToken: credentials.agent_token,
         expectedVersion: pending.expected_version,
@@ -509,6 +531,7 @@ async function main(): Promise<void> {
       });
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;
+      remember(handle, release);
       await saveState(statePath, handle);
       delete credentials.pending;
       await saveState(path, credentials);

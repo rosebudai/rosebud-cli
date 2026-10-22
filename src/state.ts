@@ -21,6 +21,10 @@ export interface ProjectHandle {
   play_url?: string;
   claim_expires_at?: string;
   content_version?: string;
+  /** Path to MD5 of every file in the last release or pull; absent for a handle from 0.1.0. */
+  files?: Record<string, string>;
+  /** Paths Rosebud holds as media; absent for a handle from 0.1.0. */
+  media?: string[];
 }
 export interface Credentials {
   api_base_url: string;
