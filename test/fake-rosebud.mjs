@@ -76,6 +76,12 @@ export async function fakeRosebud(t, options = {}) {
       headers: { "Content-Type": req.headers["content-type"] },
     }).formData();
   }
+  // Rosebud's rule for a ZIP entry: .svg and .gltf are text outside assets/, and inside it
+  // they stay text on an update when Rosebud already holds them as text.
+  const zippedAsMedia = (path) =>
+    MEDIA.test(path) &&
+    (!/\.(svg|gltf)$/.test(path) ||
+      (path.startsWith("assets/") && !game.text.has(path)));
   // A release is a snapshot: the ZIP's text plus every path the session declared.
   async function snapshot(fields, res) {
     const zip = unzipSync(
@@ -85,7 +91,7 @@ export async function fakeRosebud(t, options = {}) {
       media = new Map();
     for (const [path, bytes] of Object.entries(zip)) {
       if (path.endsWith("/")) continue;
-      if (MEDIA.test(path)) media.set(path, Buffer.from(bytes));
+      if (zippedAsMedia(path)) media.set(path, Buffer.from(bytes));
       else text.set(path, strFromU8(bytes));
     }
     if (fields.get("upload_id")) {

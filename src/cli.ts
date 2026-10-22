@@ -643,9 +643,14 @@ async function main(): Promise<void> {
         "Run status after approval to establish this connection's initial version.",
       );
     const knownMedia = new Set(handle.media ?? []);
+    // Rosebud holds these as text, whatever their extension (a Rosie-written icon.svg).
+    const knownText = new Set(
+      Object.keys(handle.files ?? {}).filter((path) => !knownMedia.has(path)),
+    );
     const release = await prepareRelease(input, {
       splitMedia: true,
       knownMedia,
+      knownText,
     });
     const cover = metadata.thumbnail
       ? await readCover(metadata.thumbnail)
@@ -689,6 +694,7 @@ async function main(): Promise<void> {
         ...metadata,
         prepared: release,
         knownMedia,
+        knownText,
         projectId: handle.project_id,
         agentToken: credentials.agent_token,
         expectedVersion: pending.expected_version,

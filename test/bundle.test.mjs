@@ -188,3 +188,182 @@ test("a text file over 19 MiB is refused when splitting, before it is read", asy
       e.message.includes("notes.txt"),
   );
 });
+
+const OS_JUNK = ["Thumbs.db", "desktop.ini", ".DS_Store"];
+
+test("OS junk files are skipped, in any case and at any depth, without an error", async (t) => {
+  const junk = Buffer.from([0, 0, 0, 1, 66, 117, 100, 49]);
+  const root = await folder(t, {
+    "index.html": "x",
+    ".DS_Store": junk,
+    "Thumbs.db": junk,
+    "desktop.ini": "[.ShellClassInfo]",
+    "assets/.DS_Store": junk,
+    "assets/hero.png": png,
+    "levels/.ds_store": junk,
+    "levels/THUMBS.DB": junk,
+    "levels/Desktop.INI": "[.ShellClassInfo]",
+    "levels/one.json": "{}",
+  });
+  for (const splitMedia of [true, false]) {
+    const release = await prepareRelease({ directory: root }, { splitMedia });
+    const listed = Object.keys(release.files).sort();
+    assert.deepEqual(listed, [
+      "assets/hero.png",
+      "index.html",
+      "levels/one.json",
+    ]);
+    const zipped = Object.keys(unzipSync(release.zip)).filter(
+      (name) => !name.endsWith("/"),
+    );
+    for (const name of zipped)
+      assert.ok(
+        !OS_JUNK.some((junkName) =>
+          name.toLowerCase().endsWith(junkName.toLowerCase()),
+        ),
+        name,
+      );
+  }
+  // Every other hidden name still refuses.
+  await writeFile(join(root, "levels/.notes"), "x");
+  await assert.rejects(
+    prepareRelease({ directory: root }, { splitMedia: true }),
+    (e) => e.code === "unsafe_path" && e.message.includes("levels/.notes"),
+  );
+});
+
+// Windows can't create names that end in a space or hold only spaces.
+const spaced = process.platform === "win32" ? [] : [" ", " "];
+
+test("a name of only whitespace is refused", async (t) => {
+  for (const name of spaced) {
+    const root = await folder(t, { "index.html": "x", [name]: "x" });
+    await assert.rejects(
+      prepareRelease({ directory: root }, { splitMedia: true }),
+      (e) => e.code === "unsafe_path" && e.outcome === "not_sent",
+      JSON.stringify(name),
+    );
+  }
+});
+
+test("names ending in .env are excluded in any case, and excluded names are compared trimmed", async (t) => {
+  const names = [
+    "prod.env",
+    "Game.ENV",
+    "config/staging.Env",
+    "FIREBASE-ADMINSDK-abc.json",
+    ...spaced.map(() => "prod.env "),
+    ...spaced.map(() => "credentials "),
+    ...spaced.map(() => "node_modules "),
+  ];
+  for (const name of names) {
+    const root = await folder(t, { "index.html": "x", [name]: "x" });
+    await assert.rejects(
+      prepareRelease({ directory: root }, { splitMedia: true }),
+      (e) => e.code === "excluded_file" && e.outcome === "not_sent",
+      name,
+    );
+  }
+  // A folder named like that is excluded as a whole; names that merely contain env are fine.
+  const folderRoot = await folder(t, { "index.html": "x", "a.env/x.js": "x" });
+  await assert.rejects(
+    prepareRelease({ directory: folderRoot }, { splitMedia: true }),
+    (e) => e.code === "excluded_file",
+  );
+  const fine = await folder(t, {
+    "index.html": "x",
+    "env.js": "x",
+    "environment.js": "x",
+    "levels.environment": "x",
+    "env/a.js": "x",
+  });
+  const release = await prepareRelease(
+    { directory: fine },
+    { splitMedia: true },
+  );
+  assert.deepEqual(Object.keys(release.files).sort(), [
+    "env.js",
+    "env/a.js",
+    "environment.js",
+    "index.html",
+    "levels.environment",
+  ]);
+});
+
+test(".svg and .gltf outside assets/ are text, checked as UTF-8; inside assets/ they are media", async (t) => {
+  const root = await folder(t, {
+    "index.html": "x",
+    "art/Logo.svg": "<svg xmlns='http://www.w3.org/2000/svg'/>",
+    "models/scene.gltf": '{"asset":{"version":"2.0"}}',
+    "assets/icon.svg": "<svg/>",
+  });
+  const release = await prepareRelease(
+    { directory: root },
+    { splitMedia: true },
+  );
+  assert.deepEqual(Object.keys(unzipSync(release.zip)).sort(), [
+    "art/Logo.svg",
+    "index.html",
+    "models/scene.gltf",
+  ]);
+  assert.deepEqual(release.mediaPaths, ["assets/icon.svg"]);
+  assert.deepEqual(
+    release.media.map((m) => m.path),
+    ["assets/icon.svg"],
+  );
+  // Text is text: bytes that aren't UTF-8 are refused as such.
+  const binary = await folder(t, {
+    "index.html": "x",
+    "art/logo.svg": Buffer.from([0xff, 0xfe, 0, 1]),
+  });
+  await assert.rejects(
+    prepareRelease({ directory: binary }, { splitMedia: true }),
+    (e) => e.code === "unsupported_file" && e.message.includes("art/logo.svg"),
+  );
+});
+
+test("paths Rosebud holds as text are sent as text, even with a media extension", async (t) => {
+  const root = await folder(t, {
+    "index.html": "x",
+    // Rosie wrote these as text, with names the media rules would refuse.
+    "assets/Icon Pack/Logo.svg": "<svg/>",
+    "assets/notes.png": "just words",
+    "assets/hero.png": png,
+  });
+  await assert.rejects(
+    prepareRelease({ directory: root }, { splitMedia: true }),
+    (e) => e.code === "noncanonical_path",
+  );
+  const knownText = new Set(["assets/Icon Pack/Logo.svg", "assets/notes.png"]);
+  const release = await prepareRelease(
+    { directory: root },
+    { splitMedia: true, knownText },
+  );
+  assert.deepEqual(Object.keys(unzipSync(release.zip)).sort(), [
+    "assets/Icon Pack/Logo.svg",
+    "assets/notes.png",
+    "index.html",
+  ]);
+  assert.deepEqual(release.mediaPaths, ["assets/hero.png"]);
+  assert.equal(
+    release.files["assets/notes.png"],
+    md5(Buffer.from("just words")),
+  );
+  // Still UTF-8 checked, like any text.
+  await writeFile(join(root, "assets/notes.png"), png);
+  await assert.rejects(
+    prepareRelease({ directory: root }, { splitMedia: true, knownText }),
+    (e) =>
+      e.code === "unsupported_file" && e.message.includes("assets/notes.png"),
+  );
+  // Media Rosebud lists as media keeps priority over a text listing of the same path.
+  const both = await prepareRelease(
+    { directory: root },
+    {
+      splitMedia: true,
+      knownText: new Set(["assets/Icon Pack/Logo.svg", "assets/notes.png"]),
+      knownMedia: new Set(["assets/notes.png"]),
+    },
+  );
+  assert.deepEqual(both.mediaPaths, ["assets/hero.png", "assets/notes.png"]);
+});

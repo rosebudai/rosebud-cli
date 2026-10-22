@@ -36,8 +36,14 @@ const MEDIA_EXTENSIONS = new Set([
   ".gltf",
   ".bin",
 ]);
+/** Rosebud keeps these as text unless they sit under assets/ (or it already holds them as media). */
+const TEXT_OUTSIDE_ASSETS = new Set([".svg", ".gltf"]);
 // The editor's file-name rules, plus no hidden names (they are usually .env or .git).
 const UNSAFE_NAME = /[<>:"/\\|?*\u0000-\u001f\u007f]/u;
+/** What operating systems scatter through folders; never game files, so never uploaded or refused. */
+const OS_JUNK = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
+export const isOsJunk = (name: string): boolean =>
+  OS_JUNK.has(name.toLowerCase());
 
 export interface MediaFile {
   /** Relative path inside the game, such as assets/hero.png. */
@@ -64,16 +70,31 @@ const md5Of = (bytes: Uint8Array) =>
 
 function checkName(name: string, path: string): void {
   // Usually a project root was published instead of its build folder.
-  if (name.startsWith("."))
+  if (name.trimStart().startsWith("."))
     throw inputError(
       "unsafe_path",
       `Hidden files and folders can't be uploaded: ${path}. Publish a folder that holds only the game's files, such as a copy in ./dist.`,
+    );
+  if (!name.trim())
+    throw inputError(
+      "unsafe_path",
+      `Rename ${path}: a name can't be only spaces.`,
     );
   if (UNSAFE_NAME.test(name) || name.length > 255 || path.length > 500)
     throw inputError(
       "unsafe_path",
       `Rename ${path}: names can't contain < > : " | ? * or control characters, and paths are at most 500 characters.`,
     );
+}
+
+/** Credentials and dependencies, matched as Rosebud does: trimmed, and in any case. */
+function excluded(name: string): boolean {
+  const key = name.trim().toLowerCase();
+  return (
+    EXCLUDED.has(key) ||
+    key.includes("firebase-adminsdk") ||
+    key.endsWith(".env")
+  );
 }
 
 function checkText(content: Uint8Array, path: string): void {
@@ -192,7 +213,8 @@ async function readBounded(path: string, limit: number): Promise<Uint8Array> {
 async function packDirectory(
   directory: string,
   split: boolean,
-  known: ReadonlySet<string>,
+  knownMedia: ReadonlySet<string>,
+  knownText: ReadonlySet<string>,
 ): Promise<PreparedRelease> {
   const root = resolve(directory);
   if (!(await lstat(root)).isDirectory())
@@ -232,6 +254,7 @@ async function packDirectory(
     // Sorting and a fixed ZIP timestamp make the same directory reproducible.
     const names = (await readdir(join(root, relative))).sort();
     for (const name of names) {
+      if (isOsJunk(name)) continue;
       const path = relative ? `${relative}/${name}` : name;
       walked += 1;
       if (walked > WALK_LIMIT)
@@ -240,10 +263,7 @@ async function packDirectory(
           `Include at most ${GAME_FILES} files, Rosebud's limit for one game.`,
         );
       checkName(name, path);
-      if (
-        EXCLUDED.has(name.toLowerCase()) ||
-        name.toLowerCase().includes("firebase-adminsdk")
-      ) {
+      if (excluded(name)) {
         throw inputError(
           "excluded_file",
           `Remove credentials and dependencies from the build directory: ${path}`,
@@ -272,9 +292,15 @@ async function packDirectory(
           `Include at most ${GAME_FILES} files, Rosebud's limit for one game.`,
         );
       const extension = extname(name);
-      const isMedia = known.has(path) || MEDIA_EXTENSIONS.has(extension);
+      // What Rosebud already holds keeps its type, media first; the rest goes by extension.
+      const heldAsMedia = knownMedia.has(path);
+      const isMedia =
+        heldAsMedia ||
+        (!knownText.has(path) &&
+          MEDIA_EXTENSIONS.has(extension) &&
+          (path.startsWith("assets/") || !TEXT_OUTSIDE_ASSETS.has(extension)));
       if (isMedia) {
-        if (!known.has(path)) validateMediaPath(path, extension);
+        if (!heldAsMedia) validateMediaPath(path, extension);
         mediaPaths.push(path);
       }
       // Text too, so an oversized file is refused before it is read.
@@ -331,7 +357,13 @@ async function packDirectory(
 
 export async function prepareRelease(
   input: { directory?: string; zip?: string },
-  options: { splitMedia?: boolean; knownMedia?: ReadonlySet<string> } = {},
+  options: {
+    splitMedia?: boolean;
+    /** Paths Rosebud holds as media: sent as media whatever their name or type. */
+    knownMedia?: ReadonlySet<string>;
+    /** Paths Rosebud holds as text: sent as text even with a media extension. */
+    knownText?: ReadonlySet<string>;
+  } = {},
 ): Promise<PreparedRelease> {
   try {
     if ((input.directory === undefined) === (input.zip === undefined))
@@ -349,6 +381,7 @@ export async function prepareRelease(
         input.directory,
         options.splitMedia ?? false,
         options.knownMedia ?? new Set(),
+        options.knownText ?? new Set(),
       );
     }
     if (

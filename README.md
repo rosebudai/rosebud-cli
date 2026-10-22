@@ -213,9 +213,11 @@ The CLI locks the state file during commands. If a process crashes, confirm it s
 
 ## Bundle and release limits
 
-Root `index.html` is required. Text files (HTML, JavaScript, CSS, JSON, Markdown notes such as `AGENTS.md`, license notices) may have any name the Rosebud editor allows: UTF-8 content; names with no leading dot (no hidden files or folders), none of `/ \ < > : " | ? *` or control characters, and at most 255 characters each; and paths of at most 500 characters. They keep their original paths and contents, so do not discard license notices. Hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected.
+Root `index.html` is required. Text files (HTML, JavaScript, CSS, JSON, Markdown notes such as `AGENTS.md`, license notices, and any other UTF-8 file that isn't media) may have any name the Rosebud editor allows: names with no leading dot (no hidden files or folders), not only spaces, none of `/ \ < > : " | ? *` or control characters, and at most 255 characters each; and paths of at most 500 characters. They keep their original paths and contents, so do not discard license notices. `.svg` and `.gltf` files outside `assets/` are text too.
 
-Binary media goes under `assets/` with a canonical lowercase name (the CLI says which rename is needed before it sends anything). The media types are PNG/JPEG/WebP/SVG images, WAV/MP3/OGG audio, WOFF/WOFF2/TTF/OTF fonts, WASM, GLB/glTF models and binary model buffers (`.bin`).
+Operating-system junk (`.DS_Store`, `Thumbs.db` and `desktop.ini`, in any case) is skipped: it is never uploaded and never an error. Other hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected. Credentials and dependencies are the names `credentials`, `secrets`, `credentials.json`, `service-account.json`, `service_account.json` and `node_modules`, any name containing `firebase-adminsdk`, and any name ending in `.env`, compared in any case and ignoring surrounding spaces. Rosebud also refuses a file that holds a private key.
+
+Binary media goes under `assets/` with a canonical lowercase name (the CLI says which rename is needed before it sends anything). The media types are PNG/JPEG/WebP/SVG images, WAV/MP3/OGG audio, WOFF/WOFF2/TTF/OTF fonts, WASM, GLB/glTF models and binary model buffers (`.bin`). A file Rosebud already holds keeps its type: media it serves is sent as media whatever its name or type, and a file it holds as text, such as an `assets/icon.svg` that Rosie wrote, stays text. The CLI learns which is which from your last `publish`, `update` or `pull`.
 
 Media goes to Rosebud file by file, not inside the ZIP, so a game is no longer limited to 10 MiB of media:
 

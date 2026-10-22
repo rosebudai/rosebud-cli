@@ -78,6 +78,8 @@ export type ReleaseInput = BundleInput &
     prepared?: PreparedRelease;
     /** Paths Rosebud holds as media (from a pull), sent as media whatever their type. */
     knownMedia?: ReadonlySet<string>;
+    /** Paths Rosebud holds as text (from a pull), sent as text even with a media extension. */
+    knownText?: ReadonlySet<string>;
     signal?: AbortSignal;
   };
 export type PublishOptions = ReleaseInput & {
@@ -474,6 +476,7 @@ async function oneZip(input: ReleaseInput): Promise<PreparedRelease> {
     return await prepareRelease(input, {
       splitMedia: false,
       ...(input.knownMedia ? { knownMedia: input.knownMedia } : {}),
+      ...(input.knownText ? { knownText: input.knownText } : {}),
     });
   } catch (error) {
     if (
@@ -1232,6 +1235,7 @@ export class Rosebud {
       (await prepareRelease(options, {
         splitMedia: true,
         ...(options.knownMedia ? { knownMedia: options.knownMedia } : {}),
+        ...(options.knownText ? { knownText: options.knownText } : {}),
       }));
     let session: UploadSession | undefined;
     if (release.media.length) {

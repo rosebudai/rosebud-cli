@@ -8,7 +8,9 @@
 - Throttled asset requests wait out Rosebud's `Retry-After` and send again, for up to a minute; longer waits report `retry_after_seconds`.
 - `rosebud pull` brings a game's current files, including edits made in Rosebud, into a folder, keeping local edits and listing conflicts. It needs the owner's plan to include code download.
 - Media now uploads file by file, so games are no longer limited to a 10 MiB ZIP. The limits are 19 MiB per file, and 2,000 files and 1 GiB per game. Files Rosebud already has aren't uploaded again.
-- Text files may have any name the Rosebud editor allows, such as Markdown notes.
+- Text files may have any name the Rosebud editor allows, such as Markdown notes, except hidden names, names of only spaces and names with `< > : " | ? * / \` or control characters. Names ending in `.env` are excluded as credentials, in any case and ignoring surrounding spaces.
+- OS junk (`.DS_Store`, `Thumbs.db`, `desktop.ini`) is skipped when packing and pulling, never uploaded and never an error. Other hidden files are still refused.
+- `.svg` and `.gltf` files outside `assets/` are text. A path Rosebud holds as text, such as an `assets/icon.svg` that Rosie wrote, stays text when you update; media Rosebud already holds stays media.
 - Update conflicts list the files that changed (`changed_paths`), and errors suggest a `next_action`.
 - A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; run the same command again, or change your files first. While `assets create` waits for a job, busy answers are waited out. Upload sessions are asked for again automatically while Rosebud checks a game's existing files.
 

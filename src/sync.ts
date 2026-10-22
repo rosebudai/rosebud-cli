@@ -13,6 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { isOsJunk } from "./bundle.js";
 import { inputError, RosebudError } from "./errors.js";
 import type { GameFiles, Rosebud } from "./index.js";
 
@@ -120,14 +121,16 @@ const linkRefused = (path: string) =>
 
 /**
  * Every game file in the folder, path → MD5. Links are refused, never followed.
- * Hidden entries and leftover temporary files are not game files: update never
- * uploads them and pull never writes them.
+ * Pull ignores hidden entries, OS junk (Thumbs.db, desktop.ini) and leftover
+ * temporary files, and never writes them. Update skips OS junk the same way, but
+ * refuses other hidden entries with unsafe_path rather than leave them behind.
  */
 async function localFiles(root: string): Promise<Map<string, string>> {
   const found = new Map<string, string>();
   async function walk(path: string): Promise<void> {
     for (const name of (await readdir(join(root, path))).sort()) {
-      if (name.startsWith(".") || LEFTOVER.test(name)) continue;
+      if (name.startsWith(".") || isOsJunk(name) || LEFTOVER.test(name))
+        continue;
       const child = path ? `${path}/${name}` : name;
       const info = await lstat(join(root, child));
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))

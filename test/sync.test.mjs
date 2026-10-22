@@ -283,6 +283,24 @@ test("giving up on a PUT says how to allow more time", async (t) => {
   assert.equal(game.releases, 0);
 });
 
+test("what Rosebud holds as text or media is kept when a game falls back to one ZIP", async (t) => {
+  const game = await fakeRosebud(t, { sync: false });
+  const root = await folder(t, {
+    "index.html": "x",
+    "assets/hero.png": png,
+    // Neither name passes the media rules for a new file.
+    "assets/Icon Pack/Logo.svg": "<svg/>",
+    "assets/Clip.mp4": Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]),
+  });
+  await new Rosebud({ apiBaseUrl: game.base }).publish({
+    directory: root,
+    knownText: new Set(["assets/Icon Pack/Logo.svg"]),
+    knownMedia: new Set(["assets/Clip.mp4"]),
+  });
+  assert.equal(game.releases, 1);
+  assert.deepEqual(game.puts, []);
+});
+
 test("a game with too many files for the one-ZIP fallback is told the old server's file limit", async (t) => {
   const game = await fakeRosebud(t, { sync: false });
   // 499 text files go in the split ZIP; one ZIP would also hold the media and assets/.
@@ -354,6 +372,39 @@ async function connected(t, game, files, { directory = "dist", state } = {}) {
 }
 const handle = async (root) =>
   JSON.parse(await readFile(join(root, ".rosebud/project.json"), "utf8"));
+
+test("an .svg outside assets/ is a text file, and a path Rosebud holds as text stays text on update", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "art/logo.svg": "<svg id='1'/>",
+  });
+  assert.equal(game.text.get("art/logo.svg"), "<svg id='1'/>");
+  assert.deepEqual((await handle(root)).media, []);
+  // Rosie wrote SVGs under assets/ as text, one with a name new media couldn't have.
+  game.edit({
+    text: {
+      "assets/icon.svg": "<svg id='a'/>",
+      "assets/Icon Pack/Logo.svg": "<svg id='b'/>",
+    },
+  });
+  const pulled = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pulled.code, 0, JSON.stringify(pulled.error));
+  assert.deepEqual((await handle(root)).media, []);
+  await writeFile(join(root, "dist/assets/icon.svg"), "<svg id='c'/>");
+  await writeFile(
+    join(root, "dist/assets/Icon Pack/Logo.svg"),
+    "<svg id='d'/>",
+  );
+  await writeFile(join(root, "dist/art/logo.svg"), "<svg id='2'/>");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(game.text.get("assets/icon.svg"), "<svg id='c'/>");
+  assert.equal(game.text.get("assets/Icon Pack/Logo.svg"), "<svg id='d'/>");
+  assert.equal(game.text.get("art/logo.svg"), "<svg id='2'/>");
+  assert.deepEqual([...game.media.keys()], []);
+  assert.deepEqual(game.puts, []);
+});
 
 test("publish and update record every file they sent", async (t) => {
   const game = await fakeRosebud(t);
@@ -1554,6 +1605,33 @@ test("the folder's own leftovers are not game files: hidden entries and old .par
   const pull = await run(root, ["pull", "--directory", "dist"]);
   assert.equal(pull.code, 0, JSON.stringify(pull.error));
   assert.deepEqual(pull.data.local_only, ["mine.js"]);
+});
+
+test("OS junk files are not game files: pull ignores them and update does not upload or refuse them", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(
+    join(root, "dist/Thumbs.db"),
+    Buffer.from([0xd0, 0xcf, 0x11]),
+  );
+  await writeFile(join(root, "dist/desktop.ini"), "[.ShellClassInfo]");
+  await mkdir(join(root, "dist/levels"));
+  await writeFile(join(root, "dist/levels/.DS_Store"), "junk");
+  await writeFile(join(root, "dist/levels/THUMBS.DB"), "junk");
+  await writeFile(join(root, "dist/levels/one.json"), "{}");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.local_only, ["levels/one.json"]);
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual([...game.text.keys()].sort(), [
+    "index.html",
+    "levels/one.json",
+  ]);
+  assert.deepEqual(Object.keys((await handle(root)).files).sort(), [
+    "index.html",
+    "levels/one.json",
+  ]);
 });
 
 test("pull leaves no temporary file in the folder, even while it works", async (t) => {
