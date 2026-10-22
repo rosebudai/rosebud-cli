@@ -49,6 +49,8 @@ export async function fakeRosebud(t, options = {}) {
     // The `remaining` each upload_retry answer carries, used verbatim, one per answer and before
     // `uploadRetries` is counted; an old Rosebud sends none.
     uploadRemaining: [...(options.uploadRemaining ?? [])],
+    // Text names are stored in NFC, as Rosebud's file rules say, whatever form was uploaded.
+    nfc: options.nfc ?? false,
     // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
     // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
     inject: [],
@@ -95,7 +97,7 @@ export async function fakeRosebud(t, options = {}) {
     for (const [path, bytes] of Object.entries(zip)) {
       if (path.endsWith("/")) continue;
       if (zippedAsMedia(path)) media.set(path, Buffer.from(bytes));
-      else text.set(path, strFromU8(bytes));
+      else text.set(game.nfc ? path.normalize("NFC") : path, strFromU8(bytes));
     }
     if (fields.get("upload_id")) {
       const session = game.sessions.get(fields.get("upload_id"));

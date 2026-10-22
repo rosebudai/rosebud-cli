@@ -548,6 +548,7 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
       { path: "goneEdited", reason: "remote_deleted" },
     ],
     localOnly: ["mine"],
+    localNames: new Map(),
   });
   // Without a last sync, every difference is a conflict, so nothing local is lost.
   assert.deepEqual(
@@ -560,6 +561,7 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
     remove: ["gone", "goneEdited"],
     conflicts: [],
     localOnly: ["mine"],
+    localNames: new Map(),
   });
   assert.deepEqual(
     planPull(
@@ -573,12 +575,133 @@ test("planPull keeps local edits, takes Rosebud's, and calls changes on both sid
       remove: [],
       conflicts: [],
       localOnly: ["z"],
+      localNames: new Map(),
     },
   );
   // A file deleted here and changed in Rosebud is a conflict too.
   assert.deepEqual(planPull(m({ x: "2" }), m({}), m({ x: "1" })).conflicts, [
     { path: "x", reason: "local_deleted" },
   ]);
+});
+
+test("planPull matches names the way the disk does, and refuses Rosebud names that would land on one file", () => {
+  const m = (o) => new Map(Object.entries(o));
+  // A disk like macOS's: letter case and Unicode form don't tell names apart.
+  const fold = (path) => path.normalize("NFC").toLowerCase();
+  const nfd = "café.js",
+    nfc = "café.js";
+  const game = m({
+    "index.html": "i",
+    "Foo.js": "U",
+    "foo.js": "l",
+    "Scripts/a.js": "a",
+    "scripts/b.js": "b",
+    "Scripts/c.js": "c",
+  });
+  const collisions = [
+    ["Foo.js", "name_collision", "foo.js"],
+    ["Scripts/a.js", "name_collision", "scripts/b.js"],
+    ["Scripts/c.js", "name_collision", "scripts/b.js"],
+    ["foo.js", "name_collision", "Foo.js"],
+    ["scripts/b.js", "name_collision", "Scripts/a.js"],
+  ];
+  const brief = (plan) =>
+    plan.conflicts.map((c) => [c.path, c.reason, c.clashesWith]);
+  // Neither of two colliding names is written, even with --force, and a local
+  // file under one of them is left alone rather than listed or removed.
+  for (const force of [false, true]) {
+    const plan = planPull(
+      game,
+      m({ "foo.js": "mine" }),
+      m({ "foo.js": "old" }),
+      force,
+      { fold },
+    );
+    assert.deepEqual(plan.write, ["index.html"]);
+    assert.deepEqual(brief(plan), collisions);
+    assert.deepEqual([plan.remove, plan.localOnly], [[], []]);
+  }
+  // A disk that tells them apart holds them all.
+  assert.deepEqual(
+    planPull(game, m({}), undefined).write,
+    [...game.keys()].sort(),
+  );
+
+  const one = (remote, local, base, force = false, folders) =>
+    planPull(m(remote), m(local), base && m(base), force, { fold, folders });
+  // The agent's edit to a file Rosebud holds under another Unicode form is kept…
+  assert.deepEqual(one({ [nfc]: "p" }, { [nfd]: "edit" }, { [nfd]: "p" }), {
+    write: [],
+    remove: [],
+    conflicts: [],
+    localOnly: [],
+    localNames: new Map(),
+  });
+  // …and when Rosebud changed it too, it is a conflict.
+  assert.deepEqual(
+    brief(one({ [nfc]: "r" }, { [nfd]: "edit" }, { [nfd]: "p" })),
+    [[nfc, "both_changed", undefined]],
+  );
+  // Rosebud's change lands on the local file, under the local name.
+  const taken = one({ [nfc]: "r" }, { [nfd]: "p" }, { [nfd]: "p" });
+  assert.deepEqual(
+    [taken.write, taken.localNames],
+    [[nfc], new Map([[nfc, nfd]])],
+  );
+  // Rosebud renamed a file by case: the old name goes, the new one is written.
+  const renamed = one({ "foo.js": "1" }, { "Foo.js": "1" }, { "Foo.js": "1" });
+  assert.deepEqual([renamed.write, renamed.remove], [["foo.js"], ["Foo.js"]]);
+  // The agent renamed it by case: that goes up with the next update.
+  assert.deepEqual(
+    one({ "Foo.js": "1" }, { "foo.js": "1" }, { "Foo.js": "1" }).write,
+    [],
+  );
+  // Renamed in Rosebud and edited here: a case_conflict, which --force settles for Rosebud.
+  assert.deepEqual(
+    brief(one({ "foo.js": "2" }, { "Foo.js": "mine" }, { "Foo.js": "1" })),
+    [["foo.js", "case_conflict", "Foo.js"]],
+  );
+  const forced = one(
+    { "foo.js": "2" },
+    { "Foo.js": "mine" },
+    { "Foo.js": "1" },
+    true,
+  );
+  assert.deepEqual([forced.write, forced.remove], [["foo.js"], ["Foo.js"]]);
+  // A file of the agent's own under another case is never replaced, even with --force.
+  for (const force of [false, true]) {
+    const own = one({ "readme.md": "r" }, { "README.md": "mine" }, {}, force);
+    assert.deepEqual(brief(own), [["readme.md", "case_conflict", "README.md"]]);
+    assert.deepEqual([own.write, own.remove, own.localOnly], [[], [], []]);
+  }
+  // A folder here spelled differently would take Rosebud's file under its own name.
+  for (const force of [false, true]) {
+    const folder = one(
+      { "scripts/b.js": "b" },
+      { "Scripts/mine.js": "m" },
+      {},
+      force,
+      ["Scripts"],
+    );
+    assert.deepEqual(brief(folder), [
+      ["scripts/b.js", "case_conflict", "Scripts"],
+    ]);
+    assert.deepEqual(
+      [folder.write, folder.localOnly],
+      [[], ["Scripts/mine.js"]],
+    );
+  }
+  // Rosebud renamed a folder by case: the folder here must be renamed first.
+  const moved = one(
+    { "scripts/a.js": "a" },
+    { "Scripts/a.js": "a" },
+    { "Scripts/a.js": "a" },
+    true,
+  );
+  assert.deepEqual(brief(moved), [
+    ["scripts/a.js", "case_conflict", "Scripts"],
+  ]);
+  assert.deepEqual([moved.write, moved.remove], [[], []]);
 });
 
 test("safePath keeps every write inside the folder", () => {
@@ -751,6 +874,8 @@ test("pull keeps conflicting local edits, saves Rosebud's copy beside the state,
   assert.equal(await readFile(join(root, "dist/index.html"), "utf8"), "mine");
   const copy = pull.data.conflicts[0].rosebud_copy;
   assert.equal(await readFile(copy, "utf8"), "rosie's");
+  // Only a conflict between two names says which other name it clashes with.
+  assert.ok(!("clashes_with" in pull.data.conflicts[0]));
   // Beside the state file, so never inside the folder that update uploads.
   assert.equal(
     await realpath(dirname(copy)),
@@ -1887,13 +2012,8 @@ test("a case-only rename never overwrites a local file that stays: it is a case_
       rosebud_copy && join(rosebud_copy),
       clashes_with,
     ]),
-    [
-      ["Foo.js", "remote_deleted", null, undefined],
-      ["foo.js", "case_conflict", copy, "Foo.js"],
-    ],
+    [["foo.js", "case_conflict", copy, "Foo.js"]],
   );
-  // Only a case_conflict names a rival.
-  assert.ok(!("clashes_with" in pull.data.conflicts[0]));
   // The local edit is untouched, under its own name; Rosebud's copy is beside it.
   assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
     "Foo.js",
@@ -1913,10 +2033,7 @@ test("a case-only rename never overwrites a local file that stays: it is a case_
   const again = await run(root, ["pull", "--directory", "dist"]);
   assert.deepEqual(
     again.data.conflicts.map((c) => [c.path, c.reason]),
-    [
-      ["Foo.js", "remote_deleted"],
-      ["foo.js", "case_conflict"],
-    ],
+    [["foo.js", "case_conflict"]],
   );
   assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
   // --force takes Rosebud's version: the old name goes first, so the new one can be written.
@@ -1937,29 +2054,35 @@ test("a file Rosebud adds that differs only in case from a file that exists only
   const root = await connected(t, game, { "index.html": "one" });
   await writeFile(join(root, "dist/README.md"), "mine");
   game.edit({
-    text: { "readme.md": "rosie's", "Assets/Lib/B.js": "b" },
+    text: {
+      "readme.md": "rosie's",
+      "Assets/Lib/B.js": "b",
+      "Levels/two.json": "{}",
+    },
     media: { "Hero.PNG": png },
   });
   await mkdir(join(root, "dist/assets/lib"), { recursive: true });
   await writeFile(join(root, "dist/assets/lib/b.js"), "mine too");
   await writeFile(join(root, "dist/hero.png"), "mine three");
+  // A folder of the agent's own would take Rosebud's file under the folder's spelling.
+  await mkdir(join(root, "dist/levels"));
+  await writeFile(join(root, "dist/levels/one.json"), "[]");
   for (const args of [[], ["--force"]]) {
     const pull = await run(root, ["pull", "--directory", "dist", ...args]);
     assert.equal(pull.code, 0, JSON.stringify(pull.error));
     assert.deepEqual(
-      pull.data.conflicts.map((c) => [c.path, c.reason]),
+      pull.data.conflicts.map((c) => [c.path, c.reason, c.clashes_with]),
       [
-        ["Assets/Lib/B.js", "case_conflict"],
-        ["Hero.PNG", "case_conflict"],
-        ["readme.md", "case_conflict"],
+        ["Assets/Lib/B.js", "case_conflict", "assets/lib/b.js"],
+        ["Hero.PNG", "case_conflict", "hero.png"],
+        ["Levels/two.json", "case_conflict", "levels"],
+        ["readme.md", "case_conflict", "README.md"],
       ],
       args.join(" "),
     );
-    assert.deepEqual(pull.data.local_only.sort(), [
-      "README.md",
-      "assets/lib/b.js",
-      "hero.png",
-    ]);
+    // Rosebud's files are the same files on this disk, so none is listed as only here.
+    assert.deepEqual(pull.data.local_only, ["levels/one.json"]);
+    assert.deepEqual(await readdir(join(root, "dist/levels")), ["one.json"]);
     assert.equal(await readFile(join(root, "dist/README.md"), "utf8"), "mine");
     assert.equal(
       await readFile(join(root, "dist/assets/lib/b.js"), "utf8"),
@@ -1997,6 +2120,118 @@ test("on a case-sensitive disk, names that differ only in case are different fil
   assert.deepEqual(pull.data.written, ["foo.js"]);
   assert.equal(await readFile(join(root, "dist/Foo.js"), "utf8"), "mine");
   assert.equal(await readFile(join(root, "dist/foo.js"), "utf8"), "2");
+});
+
+test("Rosebud names that this disk would store as one file are all refused, with each copy kept apart", async (t) => {
+  if (!(await caseInsensitiveDisk(t)))
+    return t.skip("this file system is case-sensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  const published = (await handle(root)).content_version;
+  game.edit({
+    text: {
+      "index.html":
+        "<script src='Scripts/a.js'></script><script src='scripts/b.js'></script>",
+      "Foo.js": "UPPER",
+      "foo.js": "lower",
+      "Scripts/a.js": "a",
+      "scripts/b.js": "b",
+    },
+  });
+  for (const args of [[], ["--force"]]) {
+    const pull = await run(root, ["pull", "--directory", "dist", ...args]);
+    assert.equal(pull.code, 0, JSON.stringify(pull.error));
+    assert.equal(pull.data.status, "conflicts", args.join(" "));
+    assert.deepEqual(
+      pull.data.conflicts.map((c) => [c.path, c.reason, c.clashes_with]),
+      [
+        ["Foo.js", "name_collision", "foo.js"],
+        ["Scripts/a.js", "name_collision", "scripts/b.js"],
+        ["foo.js", "name_collision", "Foo.js"],
+        ["scripts/b.js", "name_collision", "Scripts/a.js"],
+      ],
+    );
+    // None of them reached the folder, so no name swallowed another.
+    assert.deepEqual(await readdir(join(root, "dist")), ["index.html"]);
+    const copies = Object.fromEntries(
+      pull.data.conflicts.map((c) => [c.path, c.rosebud_copy]),
+    );
+    assert.equal(await readFile(copies["Foo.js"], "utf8"), "UPPER");
+    assert.equal(await readFile(copies["foo.js"], "utf8"), "lower");
+    assert.equal(await readFile(copies["Scripts/a.js"], "utf8"), "a");
+    assert.equal(await readFile(copies["scripts/b.js"], "utf8"), "b");
+    assert.ok(
+      Object.values(copies).every((copy) => copy.includes("project.remote")),
+    );
+    assert.match(pull.data.next_action, /can't tell apart/);
+    assert.match(
+      pull.data.next_action,
+      /`Foo\.js`, `Scripts\/a\.js`, `foo\.js`, `scripts\/b\.js`/,
+    );
+    assert.match(pull.data.next_action, /saved version/);
+    // The saved version stays, so the next update can't silently drop one of them.
+    assert.equal((await handle(root)).content_version, published);
+  }
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.error.code, "version_conflict");
+});
+
+// macOS stores names that differ only in Unicode form (é as one character or two) as one file.
+async function formInsensitiveDisk(t) {
+  const probe = await folder(t, { "e\u0301": "x" });
+  return readFile(join(probe, "\u00e9")).then(
+    () => true,
+    () => false,
+  );
+}
+
+test("a local edit to a file Rosebud names in another Unicode form is never overwritten", async (t) => {
+  const nfd = "cafe\u0301.js",
+    nfc = "caf\u00e9.js";
+  const game = await fakeRosebud(t, { nfc: true });
+  const root = await connected(t, game, {
+    "index.html": "x",
+    [nfd]: "published",
+  });
+  assert.ok(game.text.has(nfc));
+  await writeFile(join(root, "dist", nfd), "MY LOCAL EDIT");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(
+    await readFile(join(root, "dist", nfd), "utf8"),
+    "MY LOCAL EDIT",
+  );
+  // A disk that keeps both forms apart holds two files, and nothing was lost.
+  if (!(await formInsensitiveDisk(t))) return;
+  // One file here, unchanged in Rosebud since the last sync: the edit is the agent's own.
+  assert.equal(pull.data.status, "synced");
+  assert.deepEqual(
+    [pull.data.written, pull.data.conflicts, pull.data.local_only],
+    [[], [], []],
+  );
+  // Once Rosebud changes it too, it is a conflict, and the edit still stays.
+  game.edit({ text: { [nfc]: "rosie's" } });
+  const both = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(
+    both.data.conflicts.map((c) => [c.path, c.reason]),
+    [[nfc, "both_changed"]],
+  );
+  assert.equal(
+    await readFile(join(root, "dist", nfd), "utf8"),
+    "MY LOCAL EDIT",
+  );
+  assert.equal(
+    await readFile(both.data.conflicts[0].rosebud_copy, "utf8"),
+    "rosie's",
+  );
+  // --force takes Rosebud's text into the same file, under the name it has here.
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.deepEqual(forced.data.written, [nfc]);
+  assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
+    nfd,
+    "index.html",
+  ]);
+  assert.equal(await readFile(join(root, "dist", nfd), "utf8"), "rosie's");
 });
 
 test("conflict advice fits the conflicts, and skipped files are mentioned there too", async (t) => {

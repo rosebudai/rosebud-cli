@@ -204,9 +204,12 @@ function pullAdvice(options: {
     notes.push(
       "Rosebud lists some paths twice (duplicate_path); the first copy of each was kept.",
     );
-  // A case clash is not an edit on both sides, so it gets its own words.
+  // Clashing names are not edits on both sides, so they get their own words.
   const clashes = conflicts.filter((c) => c.reason === "case_conflict");
-  const edits = conflicts.filter((c) => c.reason !== "case_conflict");
+  const collisions = conflicts.filter((c) => c.reason === "name_collision");
+  const edits = conflicts.filter(
+    (c) => c.reason !== "case_conflict" && c.reason !== "name_collision",
+  );
   const steps =
     conflicts.length === 0
       ? [
@@ -218,9 +221,15 @@ function pullAdvice(options: {
                 `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`,
               ]
             : []),
+          ...(collisions.length > 0
+            ? [
+                `This disk can't tell apart names that differ only by letter case or Unicode form, so pull wrote none of these Rosebud files: ${collisions.map((c) => quoted(c.path)).join(", ")}. Rename them in Rosebud so no two clash, then pull again; or keep each under its own name here, fixing what refers to it. Pull left the saved version where it was.`,
+              ]
+            : []),
           ...(has("both_changed") ||
           has("local_deleted") ||
-          has("case_conflict")
+          has("case_conflict") ||
+          has("name_collision")
             ? [`Rosebud's copies are in ${quoted(options.remoteCopies)}.`]
             : []),
           ...(has("both_changed")
@@ -238,7 +247,7 @@ function pullAdvice(options: {
             : []),
           ...(clashes.length > 0
             ? [
-                `This disk treats names that differ only by letter case as one file, so pull did not write ${clashes.map((c) => `Rosebud's ${quoted(c.path)} over your ${quoted(c.clashesWith ?? c.path)}`).join(", ")}. Rename each of your files to Rosebud's name and merge Rosebud's copy into it, keeping both changes.`,
+                `This disk treats names that differ only by letter case as one, so pull did not write ${clashes.map((c) => `Rosebud's ${quoted(c.path)}, which clashes with your ${quoted(c.clashesWith ?? c.path)}`).join("; ")}. Rename each of your files or folders to Rosebud's name and merge Rosebud's copy into it, keeping both changes.`,
               ]
             : []),
           `Then run \`rosebud update ${flags} --expected-version ${version}\`.${edits.length > 0 ? ` \`rosebud pull ${flags} --force\` takes Rosebud's version of these files instead.` : ""}`,
@@ -600,16 +609,7 @@ async function main(): Promise<void> {
         force: values.force === true,
       });
       const conflicts = pulled.plan.conflicts;
-      // A conflicted path keeps its old base: pulling again must still report it,
-      // not mistake the unmerged local file for an ordinary local edit.
-      const before = new Map(Object.entries(handle.files ?? {}));
-      const files = new Map(Object.entries(pulled.files));
-      for (const { path } of conflicts) {
-        const old = before.get(path);
-        if (old === undefined) files.delete(path);
-        else files.set(path, old);
-      }
-      handle.files = Object.fromEntries(files);
+      handle.files = pulled.files;
       handle.media = pulled.media;
       // A conflicted pull keeps the old version: update stays blocked until the
       // agent merges and names the version it merged against.

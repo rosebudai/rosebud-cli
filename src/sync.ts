@@ -21,8 +21,13 @@ export type ConflictReason =
   | "both_changed"
   | "local_deleted"
   | "remote_deleted"
-  /** Rosebud's name differs only by letter case from a local file that stays, on a disk that treats them as one. */
-  | "case_conflict";
+  /**
+   * Rosebud's name and a local file or folder that stays differ only by letter case,
+   * on a disk that stores them as one: writing Rosebud's would replace or rename it.
+   */
+  | "case_conflict"
+  /** Two of Rosebud's names would land on one file or folder on this disk, so neither is written. */
+  | "name_collision";
 /** Why a path Rosebud holds was not brought in; a duplicate keeps its first copy. */
 export type SkipReason = "unsafe_path" | "duplicate_path";
 export interface PullPlan {
@@ -34,11 +39,20 @@ export interface PullPlan {
   conflicts: {
     path: string;
     reason: ConflictReason;
-    /** For a case_conflict: the local path whose name differs only by letter case. */
+    /** The other name: the local file or folder for a case_conflict, another of Rosebud's for a name_collision. */
     clashesWith?: string;
   }[];
   /** Files Rosebud never had; they stay and go up with the next update. */
   localOnly: string[];
+  /** A path to write → the local file it lands on, when this disk spells that file differently. */
+  localNames: Map<string, string>;
+}
+/** How the disk under the folder compares names. */
+export interface DiskNames {
+  /** One key for every spelling this disk stores as the same file. Default: exact names. */
+  fold?: (path: string) => string;
+  /** Every folder in the local folder, empty ones included; by default, those of the local files. */
+  folders?: Iterable<string>;
 }
 const LOCAL_LIMIT = 10_000;
 /** What an interrupted download leaves behind: `name.<uuid>.part`. */
@@ -46,44 +60,186 @@ const LEFTOVER =
   /\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.part$/i;
 const UNSAFE = /[<>:"\\|?*\u0000-\u001f\u007f]/u;
 
+const byPath = (a: { path: string }, b: { path: string }) =>
+  a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+/** Every folder a path sits in, outermost first: a/b/c → a, a/b. */
+const foldersOf = (path: string) =>
+  path
+    .split("/")
+    .slice(0, -1)
+    .map((_, index, parts) => parts.slice(0, index + 1).join("/"));
+/** Whether two names with the same key differ by more than Unicode form: by letter case, on a disk that folds it. */
+const caseDiffers = (a: string, b: string) =>
+  a.normalize("NFC") !== b.normalize("NFC");
+
 /**
  * Compare Rosebud's files, the folder and the last sync (each path → MD5).
  * Without a last sync every difference is a conflict, so nothing local is lost.
  * `force` settles conflicts for Rosebud; what changed only here is never touched.
+ *
+ * Names are matched the way the disk matches them (`disk.fold`): a local file
+ * spelled differently from Rosebud's is the same file, so an edit to it is never
+ * overwritten unseen. A difference in letter case counts as a change of name,
+ * compared with the last sync like any other change; a difference only in Unicode
+ * form does not, and Rosebud's text lands on the local file under its local name.
  */
 export function planPull(
   remote: ReadonlyMap<string, string>,
   local: ReadonlyMap<string, string>,
   base: ReadonlyMap<string, string> | undefined,
   force = false,
+  disk: DiskNames = {},
 ): PullPlan {
+  const fold = disk.fold ?? ((path: string) => path);
   const plan: PullPlan = {
     write: [],
     remove: [],
     conflicts: [],
     localOnly: [],
+    localNames: new Map(),
   };
-  for (const path of [...new Set([...remote.keys(), ...local.keys()])].sort()) {
-    const r = remote.get(path),
-      l = local.get(path),
-      b = base?.get(path);
-    if (r === l) continue;
-    if (r !== undefined) {
-      if (l === undefined) {
-        if (b === undefined || (force && b !== r)) plan.write.push(path);
-        else if (b !== r)
-          plan.conflicts.push({ path, reason: "local_deleted" });
-        // b === r: deleted here and unchanged in Rosebud; the next update deletes it.
-      } else if (l === b) plan.write.push(path);
-      else if (b === undefined || r !== b) {
-        if (force) plan.write.push(path);
-        else plan.conflicts.push({ path, reason: "both_changed" });
-      }
-      // r === b: changed here only; the next update sends it.
-    } else if (b === undefined) plan.localOnly.push(path);
-    else if (l === b || force) plan.remove.push(path);
-    else plan.conflicts.push({ path, reason: "remote_deleted" });
+  // Rosebud names that would land on one file or folder here, like Foo.js and
+  // foo.js, or Scripts/a.js and scripts/b.js: writing both would silently keep one.
+  const spellings = new Map<string, Map<string, string>>();
+  for (const path of [...remote.keys()].sort())
+    for (const name of [...foldersOf(path), path]) {
+      const seen = spellings.get(fold(name)) ?? new Map<string, string>();
+      if (!seen.has(name)) seen.set(name, path);
+      spellings.set(fold(name), seen);
+    }
+  const colliding = new Set<string>();
+  for (const path of remote.keys())
+    for (const name of [...foldersOf(path), path]) {
+      const other = [...(spellings.get(fold(name)) ?? [])].find(
+        ([spelling]) => spelling !== name,
+      );
+      if (!other) continue;
+      plan.conflicts.push({
+        path,
+        reason: "name_collision",
+        clashesWith: other[1],
+      });
+      colliding.add(fold(path));
+      break;
+    }
+  const index = (paths: Iterable<string>) => {
+    const keyed = new Map<string, string[]>();
+    for (const path of paths)
+      if (!colliding.has(fold(path)))
+        keyed.set(fold(path), [...(keyed.get(fold(path)) ?? []), path]);
+    return keyed;
+  };
+  const remoteBy = index(remote.keys()),
+    localBy = index(local.keys()),
+    baseBy = index(base?.keys() ?? []);
+  const take = (path: string, from?: string) => {
+    plan.write.push(path);
+    if (from !== undefined && caseDiffers(from, path)) plan.remove.push(from);
+    else if (from !== undefined && from !== path)
+      plan.localNames.set(path, from);
+  };
+  // R, L and B are one file's names in Rosebud, here and at the last sync.
+  const decide = (R?: string, L?: string, B?: string) => {
+    const r = R === undefined ? undefined : remote.get(R),
+      l = L === undefined ? undefined : local.get(L),
+      b = B === undefined ? undefined : base?.get(B);
+    // The same content under the same name, give or take its Unicode form.
+    const same = (x?: string, X?: string, y?: string, Y?: string) =>
+      x === y && (X === undefined || Y === undefined || !caseDiffers(X, Y));
+    if (R === undefined) {
+      if (L === undefined) return;
+      if (B === undefined) plan.localOnly.push(L);
+      else if (same(l, L, b, B) || force) plan.remove.push(L);
+      else plan.conflicts.push({ path: L, reason: "remote_deleted" });
+    } else if (L === undefined) {
+      if (B === undefined || (force && !same(b, B, r, R))) take(R);
+      else if (!same(b, B, r, R))
+        plan.conflicts.push({ path: R, reason: "local_deleted" });
+      // Deleted here and unchanged in Rosebud; the next update deletes it.
+    } else if (same(r, R, l, L)) {
+      // Already the same file and content.
+    } else if (B !== undefined && same(l, L, b, B)) take(R, L);
+    else if (B !== undefined && same(r, R, b, B)) {
+      // Changed here only (perhaps renamed by case); the next update sends it.
+    } else if (!caseDiffers(L, R)) {
+      if (force) take(R, L);
+      else plan.conflicts.push({ path: R, reason: "both_changed" });
+    } else if (force && B !== undefined && !caseDiffers(L, B)) take(R, L);
+    // Renamed by case on one side and changed on the other, or a file of the
+    // agent's own under another case: --force never replaces that.
+    else
+      plan.conflicts.push({ path: R, reason: "case_conflict", clashesWith: L });
+  };
+  for (const key of new Set([...remoteBy.keys(), ...localBy.keys()])) {
+    const R = remoteBy.get(key)?.[0];
+    const locals = localBy.get(key) ?? [];
+    const bases = baseBy.get(key) ?? [];
+    if (locals.length > 1) {
+      // Only when the key is coarser than the disk, which keeps these apart: match exactly.
+      for (const name of new Set([...(R === undefined ? [] : [R]), ...locals]))
+        decide(
+          remote.has(name) ? name : undefined,
+          local.has(name) ? name : undefined,
+          base?.has(name) ? name : undefined,
+        );
+      continue;
+    }
+    const L = locals[0];
+    const B =
+      bases.find((name) => name === L) ??
+      bases.find((name) => name === R) ??
+      bases[0];
+    decide(R, L, B);
   }
+  // A folder here whose name differs by case from Rosebud's would take the file
+  // under its own spelling, and the next update would rename it in Rosebud.
+  const folderBy = new Map<string, string>();
+  for (const folder of [
+    ...(disk.folders ?? []),
+    ...[...local.keys()].flatMap(foldersOf),
+  ])
+    folderBy.set(fold(folder), folder);
+  const renamedFrom = new Map(
+    plan.write.flatMap((path) => {
+      const L = localBy.get(fold(path))?.[0];
+      return L !== undefined && plan.remove.includes(L) ? [[path, L]] : [];
+    }),
+  );
+  plan.write = plan.write.filter((path) => {
+    if (plan.localNames.has(path)) return true;
+    for (const name of foldersOf(path)) {
+      const here = folderBy.get(fold(name));
+      if (here === undefined) continue;
+      if (caseDiffers(here, name)) {
+        plan.conflicts.push({
+          path,
+          reason: "case_conflict",
+          clashesWith: here,
+        });
+        const from = renamedFrom.get(path);
+        if (from !== undefined)
+          plan.remove.splice(plan.remove.indexOf(from), 1);
+        return false;
+      }
+    }
+    return true;
+  });
+  // Folders spelled only in another Unicode form are the same folders: write into them as they are.
+  for (const path of plan.write) {
+    if (plan.localNames.has(path)) continue;
+    const parts = path.split("/");
+    const named = parts.map((part, at) =>
+      at === parts.length - 1
+        ? part
+        : (folderBy
+            .get(fold(parts.slice(0, at + 1).join("/")))
+            ?.split("/")
+            .at(-1) ?? part),
+    );
+    if (named.join("/") !== path) plan.localNames.set(path, named.join("/"));
+  }
+  for (const list of [plan.write, plan.remove, plan.localOnly]) list.sort();
+  plan.conflicts.sort(byPath);
   return plan;
 }
 
@@ -136,8 +292,11 @@ const linkRefused = (path: string) =>
  * since the folder then ignores it, the next update leaves it out of the game.
  * Update skips junk the same way and refuses other hidden entries with unsafe_path.
  */
-async function localFiles(root: string): Promise<Map<string, string>> {
+async function localFiles(
+  root: string,
+): Promise<{ files: Map<string, string>; folders: string[] }> {
   const found = new Map<string, string>();
+  const folders: string[] = [];
   async function walk(path: string): Promise<void> {
     for (const name of (await readdir(join(root, path))).sort()) {
       if (name.startsWith(".") || LEFTOVER.test(name)) continue;
@@ -146,8 +305,10 @@ async function localFiles(root: string): Promise<Map<string, string>> {
       if (isOsJunk(name) && info.isFile()) continue;
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
         throw linkRefused(child);
-      if (info.isDirectory()) await walk(child);
-      else {
+      if (info.isDirectory()) {
+        folders.push(child);
+        await walk(child);
+      } else {
         if (found.size >= LOCAL_LIMIT)
           throw inputError(
             "entry_limit",
@@ -168,32 +329,71 @@ async function localFiles(root: string): Promise<Map<string, string>> {
     await mkdir(root, { recursive: true }); // a new folder is fine
   }
   await walk("");
-  return found;
+  return { files: found, folders };
 }
 
 /**
- * On a case-insensitive disk (macOS and Windows by default) writing `foo.js` would
- * replace a local `Foo.js` that stays, so such writes become case_conflict conflicts
- * and nothing local is lost. Asking the disk about the exact target, only when a
- * name clashes, needs no probe file and is right even for per-folder case rules.
- * A file this pull removes is no rival: Rosebud's rename by case just goes through.
+ * How the disk compares names, learned once per pull from a scratch file in
+ * `scratch`, so nothing is ever created in the game's folder. macOS and Windows
+ * disks fold letter case by default, and macOS also folds Unicode form (é as one
+ * character or two). When `scratch` sits on another disk than the folder, the
+ * answer can't speak for the folder, so both are folded: refusing a pair of names
+ * the disk could have kept apart is safe, overwriting one with the other is not.
+ */
+async function diskNames(
+  directory: string,
+  scratch: string,
+): Promise<(path: string) => string> {
+  await mkdir(scratch, { recursive: true });
+  let foldsCase = true,
+    foldsForm = true;
+  if ((await lstat(directory)).dev === (await lstat(scratch)).dev) {
+    const id = randomUUID();
+    const probe = join(scratch, `${id}-Aé`);
+    await writeFile(probe, "", { flag: "wx" });
+    const found = (name: string) =>
+      lstat(join(scratch, name)).then(
+        () => true,
+        () => false,
+      );
+    try {
+      foldsCase = await found(`${id}-aé`);
+      foldsForm = await found(`${id}-Aé`);
+    } finally {
+      await unlink(probe);
+    }
+  }
+  return (path) => {
+    const form = foldsForm ? path.normalize("NFC") : path;
+    // Upper then lower case covers more pairs than either alone (ß and SS, ſ and s).
+    return foldsCase ? form.toUpperCase().toLowerCase() : form;
+  };
+}
+
+/**
+ * A last check, for a folder whose case rules differ from the probe's (a per-folder
+ * setting on Windows and Linux): writing `foo.js` must not replace a local `Foo.js`
+ * that stays. Asking the disk about the exact target, only when a name clashes,
+ * catches that. A file this pull removes is no rival.
  */
 async function protectCaseRenames(
   directory: string,
   plan: PullPlan,
   local: ReadonlyMap<string, string>,
 ): Promise<void> {
+  const loose = (path: string) => path.normalize("NFC").toLowerCase();
   const removing = new Set(plan.remove);
   const staying = new Map<string, string>();
   for (const path of local.keys())
-    if (!removing.has(path)) staying.set(path.toLowerCase(), path);
+    if (!removing.has(path)) staying.set(loose(path), path);
   const kept: string[] = [];
   for (const path of plan.write) {
-    const rival = staying.get(path.toLowerCase());
+    const target = plan.localNames.get(path) ?? path;
+    const rival = staying.get(loose(target));
     if (
       rival !== undefined &&
-      !local.has(path) &&
-      (await lstat(join(directory, ...path.split("/"))).then(
+      rival !== target &&
+      (await lstat(join(directory, ...target.split("/"))).then(
         () => true,
         () => false,
       ))
@@ -206,9 +406,7 @@ async function protectCaseRenames(
     else kept.push(path);
   }
   plan.write = kept;
-  plan.conflicts.sort((a, b) =>
-    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
-  );
+  plan.conflicts.sort(byPath);
 }
 
 /** The target's folders exist and none is a link, so a write lands inside `root`. */
@@ -275,7 +473,11 @@ export async function pullInto(options: {
 }): Promise<{
   plan: PullPlan;
   skipped: { path: string; reason: SkipReason }[];
-  /** Rosebud's manifest: path → MD5. */
+  /**
+   * The new last sync, path → MD5: Rosebud's manifest, except that a conflicted
+   * file keeps its old entry, so pulling again still reports it rather than
+   * mistaking the unmerged local file for an ordinary local edit.
+   */
   files: Record<string, string>;
   media: string[];
   /** Conflicting path → Rosebud's copy on disk. */
@@ -319,7 +521,7 @@ export async function pullInto(options: {
     media.set(file.path, file);
     if (file.md5 !== null) remote.set(file.path, file.md5);
   }
-  const local = await localFiles(directory);
+  const { files: local, folders } = await localFiles(directory);
   await rm(remoteCopies, { recursive: true, force: true });
   const incoming = join(remoteCopies, ".incoming");
   /** Downloaded and checked, outside the folder; fetched once, whatever it is needed for. */
@@ -336,15 +538,17 @@ export async function pullInto(options: {
     return got;
   };
   try {
+    const fold = await diskNames(directory, incoming);
     // A file without a recorded MD5 is downloaded now to learn it.
     for (const [path, file] of media)
       if (file.md5 === null) remote.set(path, (await download(path)).md5);
-    const plan = planPull(
-      remote,
-      local,
-      options.base ? new Map(Object.entries(options.base)) : undefined,
-      options.force,
-    );
+    const base = options.base
+      ? new Map(Object.entries(options.base))
+      : undefined;
+    const plan = planPull(remote, local, base, options.force, {
+      fold,
+      folders,
+    });
     await protectCaseRenames(directory, plan, local);
     const fetchTo = async (path: string, target: string) => {
       const text = texts.get(path);
@@ -368,9 +572,17 @@ export async function pullInto(options: {
       }
     };
     const copies = Object.create(null) as Record<string, string>;
+    let apart = 0;
     for (const { path, reason } of plan.conflicts) {
       if (reason === "remote_deleted") continue;
-      const copy = await prepareTarget(remoteCopies, path);
+      // Colliding names would collide in the copies' folder too, so each gets its
+      // own; a leading dot keeps these folders clear of any name Rosebud can hold.
+      const copy = await prepareTarget(
+        remoteCopies,
+        reason === "name_collision"
+          ? `.name_collision/${(apart += 1)}/${path}`
+          : path,
+      );
       await fetchTo(path, copy);
       copies[path] = copy;
     }
@@ -379,11 +591,20 @@ export async function pullInto(options: {
     for (const path of plan.remove)
       await unlink(await prepareTarget(directory, path));
     for (const path of plan.write)
-      await fetchTo(path, await prepareTarget(directory, path));
+      await fetchTo(
+        path,
+        await prepareTarget(directory, plan.localNames.get(path) ?? path),
+      );
+    const conflicted = new Set(plan.conflicts.map(({ path }) => fold(path)));
+    const files = new Map(
+      [...remote].filter(([path]) => !conflicted.has(fold(path))),
+    );
+    for (const [path, md5] of base ?? [])
+      if (conflicted.has(fold(path))) files.set(path, md5);
     return {
       plan,
       skipped,
-      files: Object.fromEntries(remote),
+      files: Object.fromEntries(files),
       media: [...media.keys()].sort(),
       copies,
     };
