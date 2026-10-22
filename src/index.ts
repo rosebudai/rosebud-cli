@@ -406,10 +406,11 @@ function checkMetadata(options: GameMetadata): void {
       "Use a description of at most 4000 characters.",
     );
 }
-async function metadataForm(
+function metadataForm(
   options: GameMetadata,
   zip: Uint8Array,
-): Promise<FormData> {
+  cover: Uint8Array | undefined,
+): FormData {
   const form = new FormData();
   form.append(
     "bundle",
@@ -418,12 +419,8 @@ async function metadataForm(
   );
   for (const key of ["name", "title", "description"] as const)
     if (options[key] !== undefined) form.append(key, options[key]);
-  if (options.thumbnail !== undefined)
-    form.append(
-      "thumbnail",
-      new Blob([new Uint8Array(await readCover(options.thumbnail))]),
-      "cover",
-    );
+  if (cover !== undefined)
+    form.append("thumbnail", new Blob([new Uint8Array(cover)]), "cover");
   return form;
 }
 
@@ -441,6 +438,9 @@ function localOrHttps(value: unknown): value is string {
     ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
   );
 }
+const oneZipEntries =
+  "a game published here can hold at most 500 files and folders in one ZIP.";
+const oneZipBytes = "the whole game must fit in one 10 MiB ZIP.";
 /** The whole game in one ZIP, for a Rosebud that takes no upload sessions. */
 async function oneZip(input: ReleaseInput): Promise<PreparedRelease> {
   try {
@@ -455,7 +455,7 @@ async function oneZip(input: ReleaseInput): Promise<PreparedRelease> {
     )
       throw inputError(
         error.code,
-        `${error.message} This Rosebud server doesn't take file-by-file uploads yet, so the whole game must fit in one 10 MiB ZIP.`,
+        `${error.message} This Rosebud server doesn't take file-by-file uploads yet, so ${error.code === "entry_limit" ? oneZipEntries : oneZipBytes}`,
       );
     throw error;
   }
@@ -1067,15 +1067,29 @@ export class Rosebud {
     file: MediaFile,
     signal: AbortSignal,
   ): Promise<void> {
+    // Time for the body grows with its size: the base timeout plus about 32 KiB/s.
+    const timeoutMs = Math.min(
+      2147483647,
+      this.timeoutMs + Math.ceil(file.size / (32 * 1024)) * 1000,
+    );
     for (let attempt = 1; ; attempt += 1) {
+      // A file that can't be read now won't be by the next attempt.
+      let body: Blob;
+      try {
+        body = await openAsBlob(file.absolute);
+      } catch {
+        throw inputError(
+          "file_changed",
+          `${file.path} could not be read while uploading. Run the command again once the build has finished.`,
+        );
+      }
+      if (body.size !== file.size)
+        throw inputError(
+          "file_changed",
+          `${file.path} changed while uploading. Run the command again once the build has finished.`,
+        );
       let status: number | undefined;
       try {
-        const body = await openAsBlob(file.absolute);
-        if (body.size !== file.size)
-          throw inputError(
-            "file_changed",
-            `${file.path} changed while uploading. Run the command again once the build has finished.`,
-          );
         // Only the signed headers go: the API credential never reaches storage.
         const response = await fetch(upload.url, {
           method: "PUT",
@@ -1083,16 +1097,12 @@ export class Rosebud {
           headers: upload.headers,
           // A redirect would carry the bytes somewhere the signature didn't name.
           redirect: "error",
-          signal: AbortSignal.any([
-            AbortSignal.timeout(this.timeoutMs),
-            signal,
-          ]),
+          signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
         });
         await response.body?.cancel();
         if (response.ok) return;
         status = response.status;
-      } catch (error) {
-        if (error instanceof RosebudError) throw error;
+      } catch {
         if (signal.aborted)
           throw new RosebudError("Upload cancelled. Nothing was released.", {
             kind: "transport",
@@ -1112,7 +1122,7 @@ export class Rosebud {
         );
       if (attempt === 3)
         throw new RosebudError(
-          `Could not upload ${file.path}. Run the command again; nothing was released, and files Rosebud already has are not sent twice.`,
+          `Could not upload ${file.path}. Run the command again; nothing was released. On a slow connection, allow more time with --timeout-ms (timeoutMs in the library).`,
           { kind: "transport", code: "upload_failed", outcome: "not_sent" },
         );
       await sleep(attempt * 1000, undefined, { signal }).catch(() => undefined);
@@ -1127,6 +1137,11 @@ export class Rosebud {
     if (!options || typeof options !== "object")
       throw inputError("input_required", "Provide a directory or ZIP path.");
     checkMetadata(options);
+    // Read now, so a bad cover fails before any request or upload.
+    const cover =
+      options.thumbnail !== undefined
+        ? await readCover(options.thumbnail)
+        : undefined;
     if (options.signal?.aborted)
       throw inputError("aborted", "Upload cancelled before sending.");
     let release =
@@ -1140,7 +1155,7 @@ export class Rosebud {
       session = await this.stage(release.media, auth, options.signal);
       if (!session) release = await oneZip(options);
     }
-    const form = await metadataForm(options, release.zip);
+    const form = metadataForm(options, release.zip, cover);
     if (session) {
       form.append("upload_id", session.upload_id);
       form.append("upload_token", session.upload_token);

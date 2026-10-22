@@ -39,6 +39,7 @@ export async function fakeRosebud(t, options = {}) {
     requests: [],
     failPuts: options.failPuts ?? 0,
     refusePuts: options.refusePuts ?? false,
+    putDelayMs: options.putDelayMs ?? 0,
     loseNextRelease: false,
   };
   const manifest = () =>
@@ -158,6 +159,8 @@ export async function fakeRosebud(t, options = {}) {
         const entry = [...session.entries.values()][Number(index)];
         if (req.headers.authorization)
           return fail(res, 400, "credential_sent_to_storage");
+        if (game.putDelayMs)
+          await new Promise((resolve) => setTimeout(resolve, game.putDelayMs));
         if (game.refusePuts) return reply(res, 403, undefined);
         if (game.failPuts > 0) {
           game.failPuts -= 1;
