@@ -141,9 +141,9 @@ For a conflict that only touched the title, description or cover, run `rosebud s
 
 Active Rosebud generation blocks publication. After an interrupted update, rerun the identical command and input. If the input changed while the outcome was uncertain, check status and reconcile before submitting another release.
 
-When Rosebud is too busy to start a request it answers `busy` (HTTP 503) and changes nothing. The CLI reports it as a rejection (exit 3, outcome `rejected`) with `retry_after_seconds` when Rosebud says how long to wait. Run the same command again after that long: an update's saved operation is kept, so the rerun sends exactly the same release. A first `publish` refused as busy created nothing and is safe to run again.
+When Rosebud is too busy to start a request it answers `busy` (HTTP 503) and changes nothing. The CLI reports it as a rejection (exit 3, outcome `rejected`) with `retry_after_seconds` when Rosebud says how long to wait. Run the same command again after that long (or shortly, when Rosebud gives no time). Because nothing was applied, you may also change your files first. A first `publish` refused as busy created nothing and is safe to run again.
 
-First publication has a separate limit: a lost response may leave a created game, and a fresh `publish` may create a duplicate. Requests are not automatically retried or redirected.
+First publication has a separate limit: a lost response may leave a created game, and a fresh `publish` may create a duplicate. Requests are not redirected, and a release or publish request is never sent again on its own. Three things are repeated because they are safe: a JSON request that Rosebud throttles waits out `Retry-After` and is sent again (for up to a minute in all), a request for an upload session that is answered `upload_retry` is repeated (up to 20 times), and a media upload to storage that fails in transit is tried up to three times.
 
 Pending connections expire after 30 minutes. Approved access lasts 90 days and can be revoked sooner. It permits files, metadata and ordinary branded publication for one project. It does not permit account-wide access, AI generation, billing changes or paid deployment capabilities.
 
@@ -200,7 +200,7 @@ The login is stored with the other credentials, separate from project connection
 
 Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Each file upload also gets one extra second per 32 KiB on top of `--timeout-ms`, so large media has time to finish. Rosebud is the default destination, and subsequent commands use the saved project connection.
 
-JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` (always a number) when it reports them, so you know which file to fix. Many errors add a `next_action` saying what to do about them, such as `version_conflict` with its `changed_paths`, `release_upload_limit` or `plan_required`. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. Uploads are never sent again. Exit codes:
+JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` (always a number) when it reports them, so you know which file to fix. Many errors add a `next_action` saying what to do about them, such as `version_conflict` with its `changed_paths`, `release_upload_limit` or `plan_required`. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. While `assets create` waits for its job, a `busy` answer to a status check is waited out the same way. A release or publish is never sent again on its own. Exit codes:
 
 | Exit | Meaning                                                                                 |
 | ---- | --------------------------------------------------------------------------------------- |
@@ -213,7 +213,7 @@ The CLI locks the state file during commands. If a process crashes, confirm it s
 
 ## Bundle and release limits
 
-Root `index.html` is required. Text files (HTML, JavaScript, CSS, JSON, Markdown notes such as `AGENTS.md`, license notices) may have any name the Rosebud editor allows: UTF-8 content, no leading dot, none of `< > : " | ? *` or control characters in a name, and at most 500 characters in a path. They keep their original paths and contents, so do not discard license notices. Hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected.
+Root `index.html` is required. Text files (HTML, JavaScript, CSS, JSON, Markdown notes such as `AGENTS.md`, license notices) may have any name the Rosebud editor allows: UTF-8 content; names with no leading dot (no hidden files or folders), none of `/ \ < > : " | ? *` or control characters, and at most 255 characters each; and paths of at most 500 characters. They keep their original paths and contents, so do not discard license notices. Hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected.
 
 Binary media goes under `assets/` with a canonical lowercase name (the CLI says which rename is needed before it sends anything). The media types are PNG/JPEG/WebP/SVG images, WAV/MP3/OGG audio, WOFF/WOFF2/TTF/OTF fonts, WASM, GLB/glTF models and binary model buffers (`.bin`).
 
@@ -222,7 +222,7 @@ Media goes to Rosebud file by file, not inside the ZIP, so a game is no longer l
 - Each file is at most 19 MiB.
 - A game has at most 2,000 files and 1 GiB in all.
 - Text files travel in one ZIP of at most 10 MiB compressed, 50 MiB expanded and 500 files.
-- Rosebud also limits how much new media one update adds at once. When an update goes over it, the error is `release_upload_limit` with the limit in bytes: update with part of the new media first, then again with the rest.
+- Rosebud also limits how much new media one update adds at once, currently 128 MiB. When an update goes over it, the error is `release_upload_limit`, and it carries the exact `limit` in bytes: update with part of the new media first, then again with the rest.
 - Files Rosebud already has, with the same path, size and MD5, are not uploaded again.
 
 While Rosebud checks a game's existing files it may answer a request for an upload session with `upload_retry`. The CLI asks again by itself, after the `Retry-After` it is given (one second without one, at most 10), up to 20 times; after that it stops with `next_action` to run the same command again. A Rosebud server without file-by-file uploads still takes a game as one ZIP, up to 10 MiB compressed. `--zip` uploads an archive you made as it is, within the same ZIP limits.

@@ -10,7 +10,7 @@
 - Media now uploads file by file, so games are no longer limited to a 10 MiB ZIP. The limits are 19 MiB per file, and 2,000 files and 1 GiB per game. Files Rosebud already has aren't uploaded again.
 - Text files may have any name the Rosebud editor allows, such as Markdown notes.
 - Update conflicts list the files that changed (`changed_paths`), and errors suggest a `next_action`.
-- A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; rerunning an update sends the same operation. Upload sessions are asked for again automatically while Rosebud checks a game's existing files.
+- A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; run the same command again, or change your files first. While `assets create` waits for a job, busy answers are waited out. Upload sessions are asked for again automatically while Rosebud checks a game's existing files.
 
 ## 0.1.0
 

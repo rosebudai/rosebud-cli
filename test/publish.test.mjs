@@ -19,6 +19,7 @@ import { unzipSync, strFromU8 } from "fflate";
 import { posix, win32 } from "node:path";
 import { Rosebud, RosebudError } from "../dist/index.js";
 import { exposedToOtherUsers, outsideBuild } from "../dist/state.js";
+import { fakeRosebud } from "./fake-rosebud.mjs";
 
 const success = {
   project_id: "f6879913-2dda-484b-b1dc-3abc60cac45a",
@@ -611,6 +612,22 @@ test("rejected uploads report the server's filename and limit but nothing else f
       JSON.stringify(sent),
     );
   }
+});
+
+test("an upload_retry wait is capped at ten seconds, whatever Retry-After says", async (t) => {
+  const game = await fakeRosebud(t, {
+    uploadRetries: 1,
+    uploadRetryAfter: 3600,
+  });
+  const root = await directory(t, {
+    "index.html": "x",
+    "assets/hero.png": Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+  });
+  const started = Date.now();
+  await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+  const waited = Date.now() - started;
+  assert.ok(waited >= 9500 && waited < 20000, `waited ${waited} ms`);
+  assert.equal(game.uploadRetries, 0);
 });
 
 test("credentials only travel over HTTPS, except to a local server", () => {

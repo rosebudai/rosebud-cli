@@ -61,6 +61,7 @@ async function rosebud(t) {
     loseJobResponse: false,
     throttle: [],
     busy: 0,
+    busyPolls: 0,
     publishes: [],
     statusChecks: [],
   };
@@ -241,6 +242,11 @@ async function rosebud(t) {
     }
     const polled = path.match(/^\/api\/v1\/asset-jobs\/([^/]+)\/$/);
     if (polled) {
+      if (api.busyPolls > 0) {
+        api.busyPolls--;
+        json(res, { error: { code: "busy", message: "Try again." } }, 503);
+        return;
+      }
       api.jobs.get(polled[1]).polls++;
       json(res, job(polled[1]));
       return;
@@ -436,6 +442,26 @@ test("assets quote and create map inputs, respect --max-credits and save the fin
   assert.equal(exists.code, 2);
   assert.equal(exists.error.code, "file_exists");
   assert.equal(api.quotes.length, 3);
+});
+
+test("a busy answer while a create waits for its job is waited out like a throttle", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.busyPolls = 1;
+  const created = await cli(root, api, [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "Mossy stone tile",
+    "--out",
+    "art/moss.zip",
+  ]);
+  assert.equal(created.code, 0, created.stderr);
+  assert.equal(created.data.status, "succeeded");
+  assert.equal(api.busyPolls, 0);
+  assert.deepEqual(await readFile(join(root, "art/moss.zip")), sprite);
+  assert.equal(api.jobPosts.length, 1);
 });
 
 test("a busy refusal of a resumed create keeps its saved request, so the rerun still cannot pay twice", async (t) => {

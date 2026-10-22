@@ -607,6 +607,7 @@ export class Rosebud {
         if (
           !(error instanceof RosebudError) ||
           error.kind !== "api" ||
+          error.status !== 409 ||
           error.code !== "upload_retry" ||
           attempt === uploadRetryAttempts
         )

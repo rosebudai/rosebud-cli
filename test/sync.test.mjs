@@ -1233,16 +1233,20 @@ async function pendingOperation(root) {
   return undefined;
 }
 
-test("a busy Rosebud refused the update unapplied: wait, rerun, and the same operation is sent", async (t) => {
+test("a busy Rosebud refused the update unapplied: it is a plain rejection, so the next update may change anything", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, { "index.html": "one" });
+  const busy429 = (retryAfter) =>
+    game.inject.push({
+      path: "/releases/",
+      status: 503,
+      ...(retryAfter === undefined
+        ? {}
+        : { headers: { "Retry-After": retryAfter } }),
+      error: { code: "busy" },
+    });
   await writeFile(join(root, "dist/index.html"), "two");
-  game.inject.push({
-    path: "/releases/",
-    status: 503,
-    headers: { "Retry-After": "7" },
-    error: { code: "busy" },
-  });
+  busy429("7");
   const busy = await run(root, ["update", "--directory", "dist"]);
   assert.equal(busy.code, 3);
   assert.equal(busy.error.kind, "api");
@@ -1255,17 +1259,83 @@ test("a busy Rosebud refused the update unapplied: wait, rerun, and the same ope
     "Rosebud is busy. Run the same command again in 7 seconds; nothing was changed.",
   );
   assert.equal(game.releases, 1); // only the publish
+  assert.equal(await pendingOperation(root), undefined);
+  // Changed input after busy is an ordinary new update, not an uncertain one.
+  await writeFile(join(root, "dist/index.html"), "three");
+  const changed = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(changed.code, 0, JSON.stringify(changed.error));
+  assert.equal(game.text.get("index.html"), "three");
+  // Busy, then a Rosebud edit: pull brings it in and update carries on.
+  await writeFile(join(root, "dist/index.html"), "four");
+  busy429("1");
+  assert.equal(
+    (await run(root, ["update", "--directory", "dist"])).error.next_action,
+    "Rosebud is busy. Run the same command again in 1 second; nothing was changed.",
+  );
+  game.edit({ text: { "AGENTS.md": "rosie's notes" } });
+  const pulled = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pulled.code, 0, JSON.stringify(pulled.error));
+  assert.equal(pulled.data.status, "synced");
+  const merged = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(merged.code, 0, JSON.stringify(merged.error));
+  assert.equal(game.text.get("index.html"), "four");
+  assert.equal(game.text.get("AGENTS.md"), "rosie's notes");
+  // Without a usable Retry-After there is nothing to count.
+  for (const retryAfter of [undefined, "0"]) {
+    busy429(retryAfter);
+    const soon = await run(root, ["update", "--directory", "dist"]);
+    assert.equal(
+      soon.error.next_action,
+      "Rosebud is busy. Run the same command again shortly; nothing was changed.",
+      String(retryAfter),
+    );
+  }
+  // Only Rosebud's own busy answer is known not to have been applied.
+  await writeFile(join(root, "dist/index.html"), "five");
+  game.inject.push({ path: "/releases/", status: 503, error: { code: "x" } });
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+});
+
+test("a busy refusal of a retry after an uncertain update keeps the operation, so the rerun replays it", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/index.html"), "two");
+  game.loseNextRelease = true;
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
   const operation = await pendingOperation(root);
-  assert.ok(operation, "the pending operation survives a busy refusal");
+  assert.ok(operation);
+  game.inject.push({
+    path: "/releases/",
+    status: 503,
+    error: { code: "busy" },
+  });
+  const busy = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(busy.code, 3);
+  // The lost attempt may have been applied, so only its own retry may settle it.
+  assert.equal(await pendingOperation(root), operation);
   const again = await run(root, ["update", "--directory", "dist"]);
   assert.equal(again.code, 0, JSON.stringify(again.error));
   assert.deepEqual([...game.operations.keys()], [operation]);
+  assert.equal(game.releases, 2); // the publish and the one applied update
   assert.equal(await pendingOperation(root), undefined);
-  assert.equal(game.text.get("index.html"), "two");
-  // Only Rosebud's own busy answer is known not to have been applied.
+});
+
+test("a changed update after an uncertain one is refused with the way out", async (t) => {
+  const game = await fakeRosebud(t);
+  const state = ".rosebud/b.json";
+  const root = await connected(t, game, { "index.html": "one" }, { state });
+  await writeFile(join(root, "dist/index.html"), "two");
+  game.loseNextRelease = true;
+  const args = ["update", "--directory", "dist", "--state", state];
+  assert.equal((await run(root, args)).code, 4);
   await writeFile(join(root, "dist/index.html"), "three");
-  game.inject.push({ path: "/releases/", status: 503, error: { code: "x" } });
-  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+  const refused = await run(root, args);
+  assert.equal(refused.code, 2);
+  assert.equal(refused.error.code, "pending_operation");
+  assert.equal(
+    refused.error.next_action,
+    "Run `rosebud status --state .rosebud/b.json`, reconcile what changed in Rosebud into your files, then run your update again with `--expected-version <content_version from status>`. To retry the earlier update unchanged, rerun its identical command.",
+  );
 });
 
 test("a busy answer to a read is reported at once, not retried behind the scenes", async (t) => {
@@ -1299,7 +1369,7 @@ test("a first publish refused as busy created nothing and is safe to run again",
   assert.equal(busy.error.retry_after_seconds, undefined);
   assert.equal(
     busy.error.next_action,
-    "Rosebud is busy. Run the same command again in a few seconds; no game was created, so publishing again is safe.",
+    "Rosebud is busy. Run the same command again shortly; no game was created, so publishing again is safe.",
   );
   assert.equal(game.releases, 0);
   await assert.rejects(readFile(join(root, ".rosebud/project.json")));
@@ -1348,6 +1418,24 @@ test("after 20 upload_retry answers the CLI stops and says to run it again", asy
   );
   assert.equal(game.uploadRetries, 80);
   assert.equal(game.releases, 0);
+});
+
+test("only a 409 upload_retry is asked again", async (t) => {
+  const game = await fakeRosebud(t);
+  game.inject.push({
+    path: "/api/developer/uploads/",
+    status: 400,
+    error: { code: "upload_retry" },
+  });
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  await assert.rejects(
+    new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root }),
+    (e) => e.code === "upload_retry" && e.status === 400,
+  );
+  assert.equal(
+    game.requests.filter((r) => r.path === "/api/developer/uploads/").length,
+    1,
+  );
 });
 
 test("without a Retry-After, an upload_retry is asked again after one second", async (t) => {

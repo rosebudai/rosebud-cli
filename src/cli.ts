@@ -702,12 +702,12 @@ async function main(): Promise<void> {
       await saveState(path, credentials);
       output(result);
     } catch (error) {
-      // A busy refusal is a rejection too, but its rerun must send the very same
-      // operation, so the saved one stays.
+      // A rejection, busy included, proves this operation was not applied, so a
+      // changed rerun may start afresh; a retry of an earlier uncertain attempt
+      // keeps its operation, because that attempt may have been applied.
       if (
         error instanceof RosebudError &&
         error.outcome !== "unknown" &&
-        error.code !== "busy" &&
         !resuming
       ) {
         delete credentials.pending;
@@ -1185,10 +1185,13 @@ async function createAsset(
       try {
         job = await api.assetJob({ token, jobId: job.id });
       } catch (error) {
-        // Reading a job is safe to repeat, so brief outages only delay the next poll.
+        // Reading a job is safe to repeat, so brief outages, throttling and a busy
+        // Rosebud only delay the next poll.
         if (
           !(error instanceof RosebudError) ||
-          (error.outcome !== "unknown" && error.status !== 429)
+          (error.outcome !== "unknown" &&
+            error.status !== 429 &&
+            error.code !== "busy")
         )
           throw error;
       }
@@ -1291,16 +1294,17 @@ function nextAction(
   switch (error.code) {
     case "busy": {
       const seconds = error.retryAfterSeconds;
-      const wait =
-        seconds === undefined
-          ? "a few seconds"
-          : `${seconds} second${seconds === 1 ? "" : "s"}`;
+      const wait = seconds
+        ? `in ${seconds} second${seconds === 1 ? "" : "s"}`
+        : "shortly";
       return command === "publish"
-        ? `Rosebud is busy. Run the same command again in ${wait}; no game was created, so publishing again is safe.`
-        : `Rosebud is busy. Run the same command again in ${wait}; nothing was changed.`;
+        ? `Rosebud is busy. Run the same command again ${wait}; no game was created, so publishing again is safe.`
+        : `Rosebud is busy. Run the same command again ${wait}; nothing was changed.`;
     }
     case "upload_retry":
       return "Run the same command again; Rosebud is still checking this game's existing files.";
+    case "pending_operation":
+      return `Run \`rosebud status${state === undefined ? "" : ` --state ${shellArg(state)}`}\`, reconcile what changed in Rosebud into your files, then run your update again with \`--expected-version <content_version from status>\`. To retry the earlier update unchanged, rerun its identical command.`;
     case "version_conflict": {
       const changed = details.changed_paths;
       const pull = `\`rosebud pull ${gameFlags(directory, state)}\``;
@@ -1336,7 +1340,10 @@ main().catch((error: unknown) => {
           { kind: "response", code: "unexpected_error", outcome: "unknown" },
         );
   const details = apiDetails(known);
-  const action = known.kind === "api" ? nextAction(known, details) : undefined;
+  const action =
+    known.kind === "api" || known.code === "pending_operation"
+      ? nextAction(known, details)
+      : undefined;
   process.stderr.write(
     `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...details, ...(action ? { next_action: action } : {}), ...errorContext } })}\n`,
   );
