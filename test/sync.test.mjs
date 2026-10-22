@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { watch } from "node:fs";
 import {
+  utimes,
   mkdtemp,
   mkdir,
   readFile,
@@ -453,23 +454,33 @@ test("a lock left by a process that has gone is taken over, and a live one still
   assert.equal(live.error.code, "state_locked");
   assert.match(live.error.message, new RegExp(`process ${process.pid}`));
   assert.equal(await readFile(lock, "utf8"), `${process.pid}\n`);
-  // A lock that names no process can't be judged, so it stands too.
+  // A lock that names no process can't be judged while it is new, so it stands too…
   await writeFile(lock, "");
   assert.equal((await run(root, ["status"])).error.code, "state_locked");
-  // A takeover killed part-way leaves its guard: stale with its process, live otherwise.
+  // …but an empty one a minute old was left by a command killed as it created it.
+  const minuteAgo = new Date(Date.now() - 60_000);
+  await utimes(lock, minuteAgo, minuteAgo);
+  const empty = await run(root, ["status"]);
+  assert.equal(empty.code, 0, JSON.stringify(empty.error));
+  // A takeover killed part-way leaves its claim on the stale lock: a live claim
+  // stands, and a stale one is taken over in turn.
+  const claim = `${lock}.${gone.pid}.claim`;
   await writeFile(lock, `${gone.pid}\n`);
-  await writeFile(`${lock}.takeover`, `${process.pid}\n`);
+  await writeFile(claim, `${process.pid}\n`);
   assert.equal((await run(root, ["status"])).error.code, "state_locked");
-  await writeFile(`${lock}.takeover`, `${gone.pid}\n`);
-  const guarded = await run(root, ["status"]);
-  assert.equal(guarded.code, 0, JSON.stringify(guarded.error));
-  assert.deepEqual(
+  await writeFile(claim, `${gone.pid}\n`);
+  const claimed = await run(root, ["status"]);
+  assert.equal(claimed.code, 0, JSON.stringify(claimed.error));
+  const leftovers = async () =>
     (await readdir(join(root, ".rosebud"))).filter((name) =>
       name.startsWith("project.json."),
-    ),
-    [],
-  );
+    );
+  assert.deepEqual(await leftovers(), []);
+  // The empty guard file an earlier build could leave behind wedges nothing.
+  await writeFile(`${lock}.takeover`, "");
+  await writeFile(lock, `${gone.pid}\n`);
   assert.equal((await run(root, ["status"])).code, 0);
+  assert.deepEqual(await leftovers(), ["project.json.lock.takeover"]);
 });
 
 test(
@@ -548,10 +559,13 @@ test(
       } catch (error) {
         appendFileSync(log, \`refused \${error.code}\\n\`);
       }`;
-    for (let round = 0; round < 10; round += 1) {
+    for (let round = 0; round < 12; round += 1) {
       const gone = spawn(process.execPath, ["-e", ""]);
       await once(gone, "exit");
       await writeFile(`${state}.lock`, `${gone.pid}\n`);
+      // Every other round, a takeover of it was killed part-way and left its claim.
+      if (round % 2)
+        await writeFile(`${state}.lock.${gone.pid}.claim`, `${gone.pid}\n`);
       await writeFile(log, "");
       await Promise.all(
         Array.from({ length: 8 }, async () => {
@@ -575,7 +589,7 @@ test(
         lines.every((line) => /^(in|out|refused state_locked)$/.test(line)),
         lines.join(", "),
       );
-      // Nothing is left behind: no lock, guard or moved-aside file.
+      // Nothing is left behind: no lock, claim or temporary file.
       assert.deepEqual(await readdir(dir), ["log"], `round ${round}`);
     }
   },
@@ -595,6 +609,14 @@ test("a lock naming this very process, which doesn't hold it, is stale", async (
       withStateLock(state, async () => undefined),
       (error) => error.code === "state_locked",
     ),
+  );
+  // A lock someone removed by hand while it was held is simply gone at the end.
+  assert.equal(
+    await withStateLock(state, async () => {
+      await rm(`${state}.lock`);
+      return "done";
+    }),
+    "done",
   );
 });
 
@@ -1403,6 +1425,76 @@ test("an update from another folder than the last sync's needs a pull there or -
   ]);
   assert.equal(named.code, 0, JSON.stringify(named.error));
   assert.match((await handle(root)).directory, /dist$/);
+});
+
+test("another spelling of the same folder, through a linked parent or an unresolved path, is the same folder", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+  });
+  // The folder itself may not be a link, but a folder above it may. A junction on
+  // Windows needs no privileges and resolves like a link.
+  await symlink(
+    root,
+    join(root, "alias"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  // The temporary folder's own path may run through a link too (/var on macOS).
+  const spellings = [join(root, "dist"), "./dist/", "alias/dist"];
+  if (await caseInsensitiveDisk(t)) spellings.push("DIST");
+  for (const spelling of spellings) {
+    await writeFile(join(root, "dist/index.html"), `via ${spelling}`);
+    const update = await run(root, ["update", "--directory", spelling]);
+    assert.equal(
+      update.code,
+      0,
+      `${spelling}: ${JSON.stringify(update.error)}`,
+    );
+  }
+  // Pull through the link uses the last sync too: a file deleted there is missing, not new.
+  await rm(join(root, "dist/game.js"));
+  const pull = await run(root, ["pull", "--directory", "alias/dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.missing_locally, ["game.js"]);
+  assert.equal(pull.data.status, "synced");
+});
+
+test("with no last sync at all, conflicts are files that differ, not files changed on both sides", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await adopted(root);
+  assert.equal((await run(root, ["status"])).code, 0);
+  await writeFile(join(root, "dist/index.html"), "something local");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.match(
+    pull.data.next_action,
+    /^These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them: `index\.html`\./,
+  );
+});
+
+test("an update from a ZIP after a conflicted pull is told the command for its ZIP", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/index.html"), "mine");
+  game.edit({ text: { "index.html": "rosie's" } });
+  assert.equal(
+    (await run(root, ["pull", "--directory", "dist"])).data.status,
+    "conflicts",
+  );
+  await writeFile(
+    join(root, "my game.zip"),
+    zipSync({ "index.html": strToU8("zipped") }),
+  );
+  const zipped = await run(root, ["update", "--zip", "my game.zip"]);
+  assert.equal(zipped.error.code, "pull_conflicts");
+  assert.match(
+    zipped.error.next_action,
+    new RegExp(
+      `run \`rosebud update --zip (['"])my game\\.zip\\1 --expected-version ${game.version}\``,
+    ),
+  );
+  assert.doesNotMatch(zipped.error.next_action, /--directory/);
 });
 
 test("pull --force takes Rosebud's copies and moves the version on", async (t) => {

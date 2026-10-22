@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
@@ -158,21 +158,43 @@ const assetCommands: Record<string, number> = {
  * What Rosebud now holds, and the folder it came from, so a later pull into that
  * folder can tell local edits from Rosebud's.
  */
-function remember(
+async function remember(
   handle: ProjectHandle,
   release: PreparedRelease,
   directory: string | undefined,
-): void {
+): Promise<void> {
   if (release.files && release.mediaPaths && directory !== undefined) {
     handle.files = release.files;
     handle.media = release.mediaPaths;
-    handle.directory = resolve(directory);
+    handle.directory = await canonical(directory);
   } else {
     // A ZIP the CLI didn't build: unknown contents, so a pull compares everything.
     delete handle.files;
     delete handle.media;
     delete handle.directory;
   }
+}
+/** A folder as the disk names it, links resolved; as given when it doesn't exist. */
+async function canonical(directory: string): Promise<string> {
+  return realpath(directory).catch(() => resolve(directory));
+}
+/**
+ * Whether two spellings name one folder: the same real path, or, for another
+ * letter case on a disk that ignores it, the very same folder on disk. A folder
+ * rebuilt at the same path is still the same folder.
+ */
+async function sameFolder(a: string, b: string): Promise<boolean> {
+  if ((await canonical(a)) === (await canonical(b))) return true;
+  const [x, y] = await Promise.all(
+    [a, b].map((path) => stat(path, { bigint: true }).catch(() => undefined)),
+  );
+  return (
+    x !== undefined &&
+    y !== undefined &&
+    x.isDirectory() &&
+    x.dev === y.dev &&
+    x.ino === y.ino
+  );
 }
 /** An argument that can be pasted into a shell as one word. */
 function shellArg(arg: string): string {
@@ -205,7 +227,8 @@ function pullAdvice(options: {
   remoteCopies: string;
   version: string;
   /** Where the last sync happened, when it was another folder than this one. */
-  lastSync: string | undefined;
+  /** Set when this folder has no last sync, with where the last one was, if anywhere. */
+  lastSync: { directory?: string } | undefined;
 }): string {
   const { directory, state, conflicts, missing, hidden, skipped, version } =
     options;
@@ -260,7 +283,7 @@ function pullAdvice(options: {
             ? [
                 options.lastSync === undefined
                   ? `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`
-                  : `These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them (last: ${quoted(options.lastSync)}): ${edits.map((c) => quoted(c.path)).join(", ")}.`,
+                  : `These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them${options.lastSync.directory === undefined ? "" : ` (last: ${quoted(options.lastSync.directory)})`}: ${edits.map((c) => quoted(c.path)).join(", ")}.`,
               ]
             : []),
           ...(collisions.length > 0
@@ -502,7 +525,7 @@ async function main(): Promise<void> {
       };
       if (!publishedToAccount(result))
         handle.claim_expires_at = result.claim_expires_at;
-      remember(handle, release, directory);
+      await remember(handle, release, directory);
       const path = credentialPath(statePath, handle);
       outsideBuild(path, directory);
       await prepareCredentials(path);
@@ -649,6 +672,11 @@ async function main(): Promise<void> {
       const remoteCopies = `${statePath.replace(/\.json$/i, "")}.remote`;
       outsideBuild(remoteCopies, directory);
       const folder = resolve(directory ?? "");
+      // The last sync describes the folder it happened in, not this one.
+      const synced =
+        handle.files !== undefined &&
+        handle.directory !== undefined &&
+        (await sameFolder(handle.directory, folder));
       const game = await api.files({
         projectId: handle.project_id,
         agentToken: credentials.agent_token,
@@ -658,21 +686,19 @@ async function main(): Promise<void> {
         game,
         directory: folder,
         remoteCopies,
-        // The last sync describes the folder it happened in, not this one.
-        ...(handle.files && handle.directory === folder
-          ? { base: handle.files }
-          : {}),
+        ...(synced && handle.files ? { base: handle.files } : {}),
         force: values.force === true,
       });
       const conflicts = pulled.plan.conflicts;
-      // A last sync of another folder says nothing about who changed these files.
-      const lastSync =
-        handle.files !== undefined && handle.directory !== folder
-          ? (handle.directory ?? "unknown")
-          : undefined;
+      // Without a last sync of this folder, nothing says who changed these files.
+      const lastSync = synced
+        ? undefined
+        : handle.files !== undefined && handle.directory !== undefined
+          ? { directory: handle.directory }
+          : {};
       handle.files = pulled.files;
       handle.media = pulled.media;
-      handle.directory = folder;
+      handle.directory = await canonical(folder);
       // A conflicted pull keeps the old version, and is remembered: update stays
       // blocked until the agent merges and names the version it merged against,
       // even when the saved version is already Rosebud's (a game just connected).
@@ -733,22 +759,28 @@ async function main(): Promise<void> {
         "Run status after approval to establish this connection's initial version.",
       );
     const flags = gameFlags(directory, value("state"));
+    // The same flags for a ZIP, which names no folder.
+    const releaseFlags =
+      zip === undefined
+        ? flags
+        : `--zip ${shellArg(zip)}${value("state") === undefined ? "" : ` --state ${shellArg(value("state") ?? "")}`}`;
     // Without an explicit version, release only the folder the last sync knows.
     if (
       value("expected-version") === undefined &&
       directory !== undefined &&
       handle.directory !== undefined &&
-      resolve(directory) !== handle.directory
+      !(await sameFolder(handle.directory, directory))
     ) {
+      const here = await canonical(directory);
       refusalAdvice.next_action = `Updating from ${directory} would release its files as they are and undo what the last sync brought into ${quoted(handle.directory)}. Run \`rosebud pull ${flags}\` first, then update; or, to release this folder as it is, run \`rosebud update ${flags} --expected-version ${expectedVersion}\`.`;
       throw inputError(
         "directory_mismatch",
-        `This game's last sync was with ${handle.directory}, not ${resolve(directory)}.`,
+        `This game's last sync was with ${handle.directory}, not ${here}.`,
       );
     }
     if (value("expected-version") === undefined && handle.pull_conflicts) {
       const { paths, content_version: pulled } = handle.pull_conflicts;
-      refusalAdvice.next_action = `Resolve them as that pull's next_action said, then run \`rosebud update ${flags} --expected-version ${pulled}\` to release the result. A pull that reports no conflicts also lifts this.`;
+      refusalAdvice.next_action = `Resolve them as that pull's next_action said, then run \`rosebud update ${releaseFlags} --expected-version ${pulled}\` to release the result. A pull that reports no conflicts also lifts this.`;
       throw inputError(
         "pull_conflicts",
         `The last pull left ${paths.length === 1 ? "a conflict" : `${paths.length} conflicts`} unresolved: ${paths
@@ -818,7 +850,7 @@ async function main(): Promise<void> {
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;
       delete handle.pull_conflicts;
-      remember(handle, release, directory);
+      await remember(handle, release, directory);
       await saveState(statePath, handle);
       delete credentials.pending;
       await saveState(path, credentials);
