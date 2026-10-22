@@ -15,6 +15,7 @@
 - `.svg` and `.gltf` files outside `assets/` are text. A path Rosebud holds as text, such as an `assets/icon.svg` that Rosie wrote, stays text when you update; media Rosebud already holds stays media.
 - Update conflicts list the files that changed (`changed_paths`), and errors suggest a `next_action`.
 - A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; run the same command again, or change your files first unless an earlier update is still uncertain. While `assets create` waits for a job, busy answers are waited out. Upload sessions are asked for again automatically while Rosebud checks a game's existing files, for as long as its `remaining` count keeps falling.
+- A command stopped with Ctrl+C or SIGTERM releases its state lock and exits 130 or 143 with the error code `interrupted`, and a lock left by a process that no longer runs is taken over, so a rerun after an agent's timeout isn't refused.
 - Logins carry scopes and expire after 90 days without use. `rosebud whoami` shows `scopes` and `expires_at`. An expired login fails with `key_expired`, and a login without a needed permission fails with `insufficient_scope` and its `required_scope`; both carry a `next_action`.
 
 ## 0.1.0

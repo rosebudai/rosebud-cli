@@ -1,6 +1,7 @@
-import { constants } from "node:fs";
+import { constants, unlinkSync } from "node:fs";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   open,
@@ -8,6 +9,7 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import nodePath, { dirname, join, resolve } from "node:path";
@@ -195,26 +197,91 @@ export function outsideBuild(
       "The upload folder can't contain the CLI's saved state (--state, default .rosebud/project.json) or credentials. Publish the game's build folder, not the project root. No build step? Copy the game's files into a folder such as ./dist and publish that.",
     );
 }
+/** Locks this process holds, so a signal that stops it can release them. */
+const heldLocks = new Set<string>();
+/** Remove every lock this process holds; for a signal handler, so synchronous. */
+export function releaseLocks(): void {
+  for (const lock of heldLocks)
+    try {
+      unlinkSync(lock);
+    } catch {
+      // Already gone.
+    }
+  heldLocks.clear();
+}
+/** The process id a lock names, when it names one. */
+async function lockOwner(lock: string): Promise<number | undefined> {
+  const text = await readFile(lock, "utf8").catch(() => "");
+  return /^\d{1,10}\n?$/.test(text) ? Number(text.trim()) : undefined;
+}
+function running(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 only asks whether the process exists
+    return true;
+  } catch (error) {
+    // EPERM: it exists but belongs to someone else.
+    return !(
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ESRCH"
+    );
+  }
+}
+/**
+ * Create the lock, or take it over from a process that no longer runs: a command
+ * killed outright (as an agent's timeout does) can't remove its own. The stale
+ * lock is moved aside, not deleted, so of two commands taking it over at once only
+ * one succeeds, and a live lock moved by mistake is put back.
+ */
+async function claimLock(lock: string): Promise<FileHandle> {
+  const locked = (pid?: number) =>
+    inputError(
+      "state_locked",
+      pid === undefined
+        ? "Another command is using this state. If a previous process crashed, confirm it stopped before removing the .lock file."
+        : `Another rosebud command (process ${pid}) is using this state. Wait for it to finish, then run this one again.`,
+    );
+  try {
+    return await open(lock, "wx", 0o600);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
+      throw locked();
+  }
+  const pid = await lockOwner(lock);
+  if (pid === undefined || pid === process.pid || running(pid))
+    throw locked(pid);
+  const aside = `${lock}.${randomUUID()}.stale`;
+  try {
+    await rename(lock, aside);
+  } catch {
+    throw locked(); // another command took it over first
+  }
+  if ((await lockOwner(aside)) !== pid) {
+    await link(aside, lock).catch(() => undefined);
+    await unlink(aside).catch(() => undefined);
+    throw locked();
+  }
+  await unlink(aside);
+  try {
+    return await open(lock, "wx", 0o600);
+  } catch {
+    throw locked();
+  }
+}
 export async function withStateLock<T>(
   path: string,
   action: () => Promise<T>,
 ): Promise<T> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const lock = `${path}.lock`;
-  let file;
-  try {
-    file = await open(lock, "wx", 0o600);
-  } catch {
-    throw inputError(
-      "state_locked",
-      "Another command is using this state. If a previous process crashed, confirm it stopped before removing the .lock file.",
-    );
-  }
+  const file = await claimLock(lock);
+  heldLocks.add(lock);
   try {
     await file.writeFile(`${process.pid}\n`);
     return await action();
   } finally {
     await file.close();
     await unlink(lock);
+    heldLocks.delete(lock);
   }
 }

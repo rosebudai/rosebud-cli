@@ -32,6 +32,7 @@ import {
   outsideBuild,
   prepareCredentials,
   readState,
+  releaseLocks,
   removeState,
   saveState,
   withStateLock,
@@ -110,7 +111,8 @@ create finishes, the same command makes a new asset.
 
 Credentials live separately under ~/.config/rosebud/credentials (mode 0600).
 Keep .rosebud/ out of Git and keep state outside your build output.
-JSON goes to stdout; errors to stderr. Exit 2 input, 3 HTTP rejection, 4 unknown outcome.
+JSON goes to stdout; errors to stderr. Exit 2 input, 3 HTTP rejection, 4 unknown outcome,
+130 or 143 stopped by SIGINT or SIGTERM. Big uploads and pulls can take minutes.
 `;
 const strings = [
   "directory",
@@ -1399,6 +1401,20 @@ function nextAction(
       return undefined;
   }
 }
+
+// Agents stop commands that outlive their timeouts. Release the state locks so the
+// rerun isn't refused, and exit with the code a shell gives for the signal.
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+] as const)
+  process.on(signal, () => {
+    releaseLocks();
+    process.stderr.write(
+      `${JSON.stringify({ error: { kind: "transport", code: "interrupted", message: `Stopped by ${signal} before finishing; its state lock was released. Run the same command again to finish, except publish: an interrupted publish may already have created the game, so don't publish again automatically.`, outcome: "unknown" } })}\n`,
+    );
+    process.exit(code);
+  });
 
 main().catch((error: unknown) => {
   const known =

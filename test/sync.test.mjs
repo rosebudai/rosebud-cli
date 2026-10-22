@@ -373,6 +373,83 @@ async function connected(t, game, files, { directory = "dist", state } = {}) {
 const handle = async (root) =>
   JSON.parse(await readFile(join(root, ".rosebud/project.json"), "utf8"));
 
+test("a lock left by a process that has gone is taken over, and a live one still refuses", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  const lock = join(root, ".rosebud/project.json.lock");
+  // A process that has exited: its id names no running process now.
+  const gone = spawn(process.execPath, ["-e", ""]);
+  await once(gone, "exit");
+  await writeFile(lock, `${gone.pid}\n`);
+  const taken = await run(root, ["status"]);
+  assert.equal(taken.code, 0, JSON.stringify(taken.error));
+  await assert.rejects(readFile(lock));
+  // This test's own process is alive, so its lock stands.
+  await writeFile(lock, `${process.pid}\n`);
+  const live = await run(root, ["status"]);
+  assert.equal(live.code, 2);
+  assert.equal(live.error.code, "state_locked");
+  assert.match(live.error.message, new RegExp(`process ${process.pid}`));
+  assert.equal(await readFile(lock, "utf8"), `${process.pid}\n`);
+  // A lock that names no process can't be judged, so it stands too.
+  await writeFile(lock, "");
+  assert.equal((await run(root, ["status"])).error.code, "state_locked");
+  await rm(lock);
+  assert.equal((await run(root, ["status"])).code, 0);
+});
+
+test(
+  "a command stopped by SIGTERM or SIGINT releases its lock and exits with the signal's code",
+  { skip: process.platform === "win32" }, // Windows ends a process without a signal to handle
+  async (t) => {
+    // Rosebud never answers, as during a long upload.
+    const api = await rogueServer(t, () => undefined);
+    const root = await folder(t, { "dist/index.html": "one" });
+    const lock = join(root, ".rosebud/project.json.lock");
+    for (const [signal, exit] of [
+      ["SIGTERM", 143],
+      ["SIGINT", 130],
+    ]) {
+      const asked = api.requests.length;
+      const child = spawn(
+        process.execPath,
+        [
+          fileURLToPath(new URL("../dist/cli.js", import.meta.url)),
+          "publish",
+          "--directory",
+          "dist",
+          "--api-base",
+          api.base,
+        ],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            ROSEBUD_API_BASE: "",
+            ROSEBUD_CREDENTIALS_DIR: join(root, "credentials"),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stderr = "";
+      child.stderr.on("data", (b) => (stderr += b));
+      const closed = once(child, "close");
+      for (let wait = 0; api.requests.length === asked && wait < 200; wait += 1)
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.ok(api.requests.length > asked, "the publish reached Rosebud");
+      assert.ok((await readFile(lock, "utf8")).length > 0, "it holds the lock");
+      child.kill(signal);
+      const [code] = await closed;
+      assert.equal(code, exit, signal);
+      await assert.rejects(readFile(lock), signal);
+      const error = JSON.parse(stderr).error;
+      assert.equal(error.code, "interrupted");
+      assert.equal(error.outcome, "unknown");
+      assert.match(error.message, new RegExp(signal));
+    }
+  },
+);
+
 test("an .svg outside assets/ is a text file, and a path Rosebud holds as text stays text on update", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, {

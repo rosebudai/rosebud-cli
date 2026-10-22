@@ -208,14 +208,17 @@ Uploads accept exactly one of `--directory` and `--zip`. Common options are `--s
 
 JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` (always a number) when it reports them, so you know which file to fix. Many errors add a `next_action` saying what to do about them, such as `version_conflict` with its `changed_paths`, `release_upload_limit` or `plan_required`. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. While `assets create` waits for its job, a `busy` answer to a status check is waited out the same way. A release or publish is never sent again on its own. Exit codes:
 
-| Exit | Meaning                                                                                 |
-| ---- | --------------------------------------------------------------------------------------- |
-| 0    | Command succeeded. Check `status` or `whoami` to see whether approval is still pending. |
-| 2    | Local input or usage error. Correct the command or build.                               |
-| 3    | HTTP rejection. Read its error code before retrying.                                    |
-| 4    | The outcome is uncertain. Use the documented recovery path.                             |
+| Exit     | Meaning                                                                                 |
+| -------- | --------------------------------------------------------------------------------------- |
+| 0        | Command succeeded. Check `status` or `whoami` to see whether approval is still pending. |
+| 2        | Local input or usage error. Correct the command or build.                               |
+| 3        | HTTP rejection. Read its error code before retrying.                                    |
+| 4        | The outcome is uncertain. Use the documented recovery path.                             |
+| 130, 143 | Stopped by SIGINT or SIGTERM (`interrupted`). The lock was released; see below.         |
 
-The CLI locks the state file during commands. If a process crashes, confirm it stopped before removing the neighboring `.lock` file. Run commands against one state file sequentially.
+The CLI locks the state file while a command runs, so run commands against one state file one at a time. A command stopped with Ctrl+C or SIGTERM releases its lock and exits with code 130 or 143 and the error code `interrupted`. A lock left by a process that is no longer running, such as one killed outright, is taken over by the next command.
+
+Large publishes, updates and pulls can take minutes: each media file goes up or comes down on its own, and Rosebud may first check a big game's existing files (`upload_retry`, below). Allow that time, or run the command in the background. Rerunning an interrupted update, pull or `assets create` is safe and finishes the work. An interrupted publish may already have created the game, so check before publishing again.
 
 ## Bundle and release limits
 
@@ -233,7 +236,7 @@ Media goes to Rosebud file by file, not inside the ZIP, so a game is no longer l
 - Rosebud also limits how much new media one update adds at once, currently 128 MiB. When an update goes over it, the error is `release_upload_limit`, and it carries the exact `limit` in bytes: update with part of the new media first, then again with the rest.
 - Files Rosebud already has, with the same path, size and MD5, are not uploaded again.
 
-While Rosebud checks a game's existing files it may answer a request for an upload session with `upload_retry`. The answer carries `remaining`, the number of the game's files still to be checked, and every identical request lowers it. The CLI asks again by itself, after the `Retry-After` it is given (one second without one, at most 10), for as long as `remaining` keeps falling. It stops with `next_action` to run the same command again when `remaining` fails to fall twice in a row, or after 500 requests. A Rosebud that sends no usable `remaining` is asked up to 20 times. A Rosebud server without file-by-file uploads still takes a game as one ZIP, up to 10 MiB compressed. `--zip` uploads an archive you made as it is, within the same ZIP limits.
+While Rosebud checks a game's existing files it may answer a request for an upload session with `upload_retry`. The answer carries `remaining`, the number of the game's files still to be checked, and every identical request lowers it. The CLI asks again by itself, after the `Retry-After` it is given (one second without one, at most 10), for as long as `remaining` keeps falling. It stops with `next_action` to run the same command again when `remaining` fails to fall twice in a row, or after 500 requests. A Rosebud that sends no usable `remaining` is asked up to 20 times. For a game with many files this wait can take several minutes. Nothing is released while it lasts, so stopping the command and running it again later is safe. A Rosebud server without file-by-file uploads still takes a game as one ZIP, up to 10 MiB compressed. `--zip` uploads an archive you made as it is, within the same ZIP limits.
 
 Build locally before publishing, and keep developer tools and credentials outside the game build.
 
