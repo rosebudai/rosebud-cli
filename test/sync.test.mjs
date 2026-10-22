@@ -1471,6 +1471,111 @@ test("after 20 upload_retry answers the CLI stops and says to run it again", asy
   assert.equal(game.releases, 0);
 });
 
+const sessionAsks = (game) =>
+  game.requests.filter((r) => r.path === "/api/developer/uploads/").length;
+const fallingFrom = (count) =>
+  Array.from({ length: count }, (_, index) => count - index);
+async function publishWithMedia(t, game) {
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  return new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+}
+
+test("while Rosebud's remaining count falls, the identical request is repeated past 20 attempts", async (t) => {
+  const game = await fakeRosebud(t, {
+    uploadRetryAfter: 0,
+    uploadRemaining: fallingFrom(45),
+  });
+  await publishWithMedia(t, game);
+  assert.equal(sessionAsks(game), 46);
+  assert.equal(game.releases, 1);
+  // A count that stands still once is not a stall, only twice in a row is.
+  const slow = await fakeRosebud(t, {
+    uploadRetryAfter: 0,
+    uploadRemaining: [5, 5, 4, 4, 3, 3, 2, 2, 1],
+  });
+  await publishWithMedia(t, slow);
+  assert.equal(sessionAsks(slow), 10);
+});
+
+test("a remaining count that fails to fall twice in a row ends the retries", async (t) => {
+  for (const [remaining, asks] of [
+    [[5, 4, 4, 4, 4, 4], 4],
+    [[7, 7, 7, 7], 3],
+    [[3, 4, 5, 6], 3],
+  ]) {
+    const game = await fakeRosebud(t, {
+      uploadRetryAfter: 0,
+      uploadRemaining: remaining,
+    });
+    await assert.rejects(
+      publishWithMedia(t, game),
+      (e) => e.code === "upload_retry" && e.outcome === "rejected",
+      remaining.join(","),
+    );
+    assert.equal(sessionAsks(game), asks, remaining.join(","));
+    assert.equal(game.releases, 0);
+  }
+  // The command says what to do, as after any other upload_retry stop.
+  const game = await fakeRosebud(t, {
+    uploadRetryAfter: 0,
+    uploadRemaining: [9, 9, 9, 9],
+  });
+  const root = await folder(t, {
+    "dist/index.html": "one",
+    "dist/assets/hero.png": png,
+  });
+  const result = await run(root, [
+    "publish",
+    "--directory",
+    "dist",
+    "--api-base",
+    game.base,
+  ]);
+  assert.equal(result.code, 3);
+  assert.equal(result.error.code, "upload_retry");
+  assert.equal(
+    result.error.next_action,
+    "Run the same command again; Rosebud is still checking this game's existing files.",
+  );
+});
+
+test("without a numeric remaining count, an upload session is asked for at most 20 times", async (t) => {
+  for (const uploadRemaining of [
+    Array(100).fill("3"),
+    Array(100).fill(null),
+    Array(100).fill(-1),
+    [5, 4, ...Array(100).fill(undefined)],
+  ]) {
+    const game = await fakeRosebud(t, {
+      uploadRetryAfter: 0,
+      uploadRemaining,
+      uploadRetries: 100,
+    });
+    await assert.rejects(
+      publishWithMedia(t, game),
+      (e) => e.code === "upload_retry",
+      JSON.stringify(uploadRemaining.slice(0, 3)),
+    );
+    assert.equal(
+      sessionAsks(game),
+      20,
+      JSON.stringify(uploadRemaining.slice(0, 3)),
+    );
+  }
+});
+
+test("a falling remaining count still stops at 500 attempts", async (t) => {
+  const game = await fakeRosebud(t, {
+    uploadRetryAfter: 0,
+    uploadRemaining: fallingFrom(800),
+  });
+  await assert.rejects(
+    publishWithMedia(t, game),
+    (e) => e.code === "upload_retry",
+  );
+  assert.equal(sessionAsks(game), 500);
+});
+
 test("only a 409 upload_retry is asked again", async (t) => {
   const game = await fakeRosebud(t);
   game.inject.push({
@@ -1634,6 +1739,40 @@ test("OS junk files are not game files: pull ignores them and update does not up
   ]);
 });
 
+test("pull treats only a regular file named like OS junk as junk: a folder is walked and a link is refused", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await mkdir(join(root, "dist/Thumbs.db"));
+  await writeFile(join(root, "dist/Thumbs.db/level.json"), "{}");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.local_only, ["Thumbs.db/level.json"]);
+  if (process.platform === "win32") return; // creating links needs privileges there
+  await symlink(join(root, "dist/index.html"), join(root, "dist/desktop.ini"));
+  const linked = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(linked.error.code, "unsupported_input");
+  assert.match(linked.error.message, /desktop\.ini/);
+});
+
+test("a junk-named file that Rosebud holds is written by pull, then ignored, so the next update leaves it out", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.edit({ text: { "Thumbs.db": "rosie made this" } });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.deepEqual(pull.data.written, ["Thumbs.db"]);
+  assert.equal(
+    await readFile(join(root, "dist/Thumbs.db"), "utf8"),
+    "rosie made this",
+  );
+  const again = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(again.data.status, "synced");
+  assert.deepEqual(again.data.local_only, []);
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual([...game.text.keys()], ["index.html"]);
+});
+
 test("pull leaves no temporary file in the folder, even while it works", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, {
@@ -1742,16 +1881,19 @@ test("a case-only rename never overwrites a local file that stays: it is a case_
   assert.deepEqual(pull.data.written, []);
   const copy = join(await realpath(root), ".rosebud/project.remote/foo.js");
   assert.deepEqual(
-    pull.data.conflicts.map(({ path, reason, rosebud_copy }) => [
+    pull.data.conflicts.map(({ path, reason, rosebud_copy, clashes_with }) => [
       path,
       reason,
       rosebud_copy && join(rosebud_copy),
+      clashes_with,
     ]),
     [
-      ["Foo.js", "remote_deleted", null],
-      ["foo.js", "case_conflict", copy],
+      ["Foo.js", "remote_deleted", null, undefined],
+      ["foo.js", "case_conflict", copy, "Foo.js"],
     ],
   );
+  // Only a case_conflict names a rival.
+  assert.ok(!("clashes_with" in pull.data.conflicts[0]));
   // The local edit is untouched, under its own name; Rosebud's copy is beside it.
   assert.deepEqual((await readdir(join(root, "dist"))).sort(), [
     "Foo.js",

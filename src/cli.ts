@@ -622,10 +622,11 @@ async function main(): Promise<void> {
         written: pulled.plan.write,
         removed: pulled.plan.remove,
         local_only: pulled.plan.localOnly,
-        conflicts: conflicts.map(({ path, reason }) => ({
+        conflicts: conflicts.map(({ path, reason, clashesWith }) => ({
           path,
           reason,
           rosebud_copy: pulled.copies[path] ?? null,
+          ...(clashesWith !== undefined ? { clashes_with: clashesWith } : {}),
         })),
         skipped: pulled.skipped,
         next_action: pullAdvice({

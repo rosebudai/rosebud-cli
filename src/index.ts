@@ -353,8 +353,25 @@ function apiError(
 }
 /** How long JSON requests wait out throttling, in total, before reporting it. */
 const throttleBudgetMs = 60_000;
-/** Asks for an upload session while Rosebud fingerprints the game's existing files. */
+/**
+ * Asks for an upload session while Rosebud checks the game's existing files. Every
+ * identical request moves it along and its `remaining` count falls; a Rosebud that
+ * reports none is asked up to 20 times, and no progress is ever followed past 500.
+ */
 const uploadRetryAttempts = 20;
+const uploadRetryCeiling = 500;
+/** Answers in a row that may fail to lower `remaining` before the CLI stops asking. */
+const uploadRetryStalls = 2;
+/** The `remaining` count of an upload_retry answer, when it is a usable number. */
+function remainingPaths(error: RosebudError): number | undefined {
+  const detail = isObject(error.body) ? error.body.error : undefined;
+  const remaining = isObject(detail) ? detail.remaining : undefined;
+  return typeof remaining === "number" &&
+    Number.isInteger(remaining) &&
+    remaining >= 0
+    ? remaining
+    : undefined;
+}
 function downloadInterrupted(signal: AbortSignal): RosebudError {
   return new RosebudError(
     "The download was interrupted and no file was saved. Run the command again to retry it.",
@@ -594,6 +611,8 @@ export class Rosebud {
         : {}),
     });
     let body: Record<string, JsonValue>;
+    let remaining: number | undefined;
+    let stalls = 0;
     for (let attempt = 1; ; attempt += 1) {
       try {
         body = await this.request(
@@ -605,16 +624,25 @@ export class Rosebud {
         );
         break;
       } catch (error) {
-        // Rosebud is still fingerprinting this game's existing files and every
+        // Rosebud is still checking this game's existing files and every
         // identical request moves it along, so ask again once it says to.
         if (
           !(error instanceof RosebudError) ||
           error.kind !== "api" ||
           error.status !== 409 ||
           error.code !== "upload_retry" ||
-          attempt === uploadRetryAttempts
+          attempt >= uploadRetryCeiling
         )
           throw error;
+        const left = remainingPaths(error);
+        if (left === undefined) {
+          if (attempt >= uploadRetryAttempts) throw error;
+        } else {
+          stalls =
+            remaining !== undefined && left >= remaining ? stalls + 1 : 0;
+          remaining = left;
+          if (stalls >= uploadRetryStalls) throw error;
+        }
         await sleep(
           Math.min(error.retryAfterSeconds ?? 1, 10) * 1000,
           undefined,

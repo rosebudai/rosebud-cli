@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -233,7 +233,7 @@ test("OS junk files are skipped, in any case and at any depth, without an error"
 });
 
 // Windows can't create names that end in a space or hold only spaces.
-const spaced = process.platform === "win32" ? [] : [" ", " "];
+const spaced = process.platform === "win32" ? [] : [" ", "\u00a0"];
 
 test("a name of only whitespace is refused", async (t) => {
   for (const name of spaced) {
@@ -255,6 +255,9 @@ test("names ending in .env are excluded in any case, and excluded names are comp
     ...spaced.map(() => "prod.env "),
     ...spaced.map(() => "credentials "),
     ...spaced.map(() => "node_modules "),
+    // Hidden means a raw leading dot, as for Rosebud; a space before it is trimmed
+    // for the exclusion list, which a .env name is on.
+    ...spaced.flatMap((blank) => [`${blank}.env`, `${blank}.ENV `]),
   ];
   for (const name of names) {
     const root = await folder(t, { "index.html": "x", [name]: "x" });
@@ -366,4 +369,42 @@ test("paths Rosebud holds as text are sent as text, even with a media extension"
     },
   );
   assert.deepEqual(both.mediaPaths, ["assets/hero.png", "assets/notes.png"]);
+});
+
+test("only a regular file is OS junk: a folder or link with such a name takes the normal path", async (t) => {
+  // A folder named like junk is an ordinary folder, and its files ship.
+  const folderRoot = await folder(t, {
+    "index.html": "x",
+    "Thumbs.db/level.json": "{}",
+  });
+  const release = await prepareRelease(
+    { directory: folderRoot },
+    { splitMedia: true },
+  );
+  assert.deepEqual(Object.keys(release.files).sort(), [
+    "Thumbs.db/level.json",
+    "index.html",
+  ]);
+  // A hidden folder is refused, junk name or not.
+  const hidden = await folder(t, {
+    "index.html": "x",
+    ".DS_Store/a.json": "{}",
+  });
+  await assert.rejects(
+    prepareRelease({ directory: hidden }, { splitMedia: true }),
+    (e) => e.code === "unsafe_path" && e.message.includes(".DS_Store"),
+  );
+  // Creating links needs privileges on Windows.
+  if (process.platform === "win32") return;
+  for (const name of ["desktop.ini", ".DS_Store"]) {
+    const linked = await folder(t, { "index.html": "x" });
+    await symlink(join(linked, "index.html"), join(linked, name));
+    await assert.rejects(
+      prepareRelease({ directory: linked }, { splitMedia: true }),
+      (e) =>
+        ["unsupported_input", "unsafe_path"].includes(e.code) &&
+        e.message.includes(name),
+      name,
+    );
+  }
 });

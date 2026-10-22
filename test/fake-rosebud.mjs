@@ -46,6 +46,9 @@ export async function fakeRosebud(t, options = {}) {
     damageMedia: options.damageMedia ?? false, // media downloads lose their last byte
     uploadRetries: options.uploadRetries ?? 0, // upload sessions answered 409 upload_retry, one each
     uploadRetryAfter: options.uploadRetryAfter, // their Retry-After seconds, when given
+    // The `remaining` each upload_retry answer carries, used verbatim, one per answer and before
+    // `uploadRetries` is counted; an old Rosebud sends none.
+    uploadRemaining: [...(options.uploadRemaining ?? [])],
     // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
     // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
     inject: [],
@@ -151,8 +154,10 @@ export async function fakeRosebud(t, options = {}) {
       }
       if (route === "/api/developer/uploads/" && req.method === "POST") {
         if (!game.sync) return fail(res, 503, "sync_unavailable");
-        if (game.uploadRetries > 0) {
-          game.uploadRetries -= 1;
+        if (game.uploadRemaining.length > 0 || game.uploadRetries > 0) {
+          const progress = game.uploadRemaining.length > 0;
+          const remaining = progress ? game.uploadRemaining.shift() : undefined;
+          if (!progress) game.uploadRetries -= 1;
           return res
             .writeHead(409, {
               "Content-Type": "application/json",
@@ -165,6 +170,7 @@ export async function fakeRosebud(t, options = {}) {
                 error: {
                   code: "upload_retry",
                   message: "Still checking this game's files.",
+                  ...(progress ? { remaining } : {}),
                 },
               }),
             );

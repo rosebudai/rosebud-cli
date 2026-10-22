@@ -70,7 +70,7 @@ const md5Of = (bytes: Uint8Array) =>
 
 function checkName(name: string, path: string): void {
   // Usually a project root was published instead of its build folder.
-  if (name.trimStart().startsWith("."))
+  if (name.startsWith("."))
     throw inputError(
       "unsafe_path",
       `Hidden files and folders can't be uploaded: ${path}. Publish a folder that holds only the game's files, such as a copy in ./dist.`,
@@ -254,7 +254,9 @@ async function packDirectory(
     // Sorting and a fixed ZIP timestamp make the same directory reproducible.
     const names = (await readdir(join(root, relative))).sort();
     for (const name of names) {
-      if (isOsJunk(name)) continue;
+      // Only a regular file is junk; a folder or link with such a name is checked as usual.
+      if (isOsJunk(name) && (await lstat(join(root, relative, name))).isFile())
+        continue;
       const path = relative ? `${relative}/${name}` : name;
       walked += 1;
       if (walked > WALK_LIMIT)
