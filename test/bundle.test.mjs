@@ -155,3 +155,36 @@ test("an existing ZIP passes through with no manifest", async (t) => {
   assert.equal(release.files, undefined);
   assert.equal(release.mediaPaths, undefined);
 });
+
+test("without splitting, the ZIP is byte for byte what 0.1.0 packed", async (t) => {
+  const root = await folder(t, {
+    "index.html": "<p>Game</p>",
+    LICENSE: "MIT License\n",
+    "nested/game.js": "export const speed = 3;\n".repeat(40),
+    "assets/hero.png": png,
+    "assets/a-b.png": png,
+    "assets/a/b.png": png,
+  });
+  await mkdir(join(root, "empty"));
+  const { zip } = await prepareRelease({ directory: root });
+  // The SHA-256 of the ZIP that 0.1.0 (e503d31's packer) builds from this folder.
+  assert.equal(
+    createHash("sha256").update(zip).digest("hex"),
+    "45e82c4bf941d776d40c96f649f8ec363a0ae7a13666e2515ab40694665a9aac",
+  );
+});
+
+test("a text file over 19 MiB is refused when splitting, before it is read", async (t) => {
+  // Repeated letters compress to almost nothing, so only the size check can refuse it.
+  const root = await folder(t, {
+    "index.html": "x",
+    "notes.txt": Buffer.alloc(FILE_BYTES + 1, "a"),
+  });
+  await assert.rejects(
+    prepareRelease({ directory: root }, { splitMedia: true }),
+    (e) =>
+      e.code === "file_limit" &&
+      e.outcome === "not_sent" &&
+      e.message.includes("notes.txt"),
+  );
+});

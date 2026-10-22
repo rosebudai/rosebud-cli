@@ -277,12 +277,13 @@ async function packDirectory(
         if (!known.has(path)) validateMediaPath(path, extension);
         mediaPaths.push(path);
       }
+      // Text too, so an oversized file is refused before it is read.
+      if (split && stat.size > FILE_BYTES)
+        throw inputError(
+          "file_limit",
+          `Reduce ${path} to at most ${FILE_BYTES} bytes, Rosebud's limit for one file.`,
+        );
       if (isMedia && split) {
-        if (stat.size > FILE_BYTES)
-          throw inputError(
-            "file_limit",
-            `Reduce ${path} to at most ${FILE_BYTES} bytes, Rosebud's limit for one file.`,
-          );
         const { size, md5 } = await digest(absolute, path);
         if (size === 0)
           throw inputError(
