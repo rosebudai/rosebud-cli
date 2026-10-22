@@ -29,6 +29,11 @@ export interface ProjectHandle {
   media?: string[];
   /** The folder `files` describes, absolute; a pull into any other folder ignores `files`. */
   directory?: string;
+  /**
+   * The last pull's unresolved conflicts, with the version it read. Until a pull
+   * reports none, update needs --expected-version, even when the saved version is current.
+   */
+  pull_conflicts?: { content_version: string; paths: string[] };
 }
 export interface Credentials {
   api_base_url: string;

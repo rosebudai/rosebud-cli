@@ -204,6 +204,8 @@ function pullAdvice(options: {
   skipped: { path: string; reason: SkipReason }[];
   remoteCopies: string;
   version: string;
+  /** Where the last sync happened, when it was another folder than this one. */
+  lastSync: string | undefined;
 }): string {
   const { directory, state, conflicts, missing, hidden, skipped, version } =
     options;
@@ -221,7 +223,7 @@ function pullAdvice(options: {
           .map(quoted)
           .join(
             ", ",
-          )}${missing.length > 10 ? ", …" : ""}; your next update removes ${one ? "it" : "them"} from the game unless you restore ${one ? "it" : "them"}, and \`rosebud pull ${flags} --force\` restores ${one ? "it" : "them"}.`;
+          )}${missing.length > 10 ? ", …" : ""}; your next update removes ${one ? "it" : "them"} from the game unless you restore ${one ? "it" : "them"}, and \`rosebud pull ${flags} --force\` restores ${one ? "it" : "them"}${conflicts.length > 0 ? ", though it also settles the conflicts above for Rosebud, discarding your edits to those files" : ""}.`;
   if (restore && conflicts.length > 0) notes.push(restore);
   if (skipped.some((s) => s.reason === "unsafe_path"))
     notes.push(
@@ -256,7 +258,9 @@ function pullAdvice(options: {
       : [
           ...(edits.length > 0
             ? [
-                `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`,
+                options.lastSync === undefined
+                  ? `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`
+                  : `These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them (last: ${quoted(options.lastSync)}): ${edits.map((c) => quoted(c.path)).join(", ")}.`,
               ]
             : []),
           ...(collisions.length > 0
@@ -303,11 +307,20 @@ function malformedManifest(handle: ProjectHandle): boolean {
       )) ||
     (media !== undefined &&
       !(Array.isArray(media) && media.every((v) => typeof v === "string"))) ||
-    (handle.directory !== undefined && typeof handle.directory !== "string")
+    (handle.directory !== undefined && typeof handle.directory !== "string") ||
+    (handle.pull_conflicts !== undefined &&
+      !(
+        isObject(handle.pull_conflicts) &&
+        typeof handle.pull_conflicts.content_version === "string" &&
+        Array.isArray(handle.pull_conflicts.paths) &&
+        handle.pull_conflicts.paths.every((v) => typeof v === "string")
+      ))
   );
 }
 /** Ids that help recover from an error, added to its JSON. */
 const errorContext: { job_id?: string; asset_id?: string } = {};
+/** What to do about a refusal the CLI makes itself, when it needs more than the error code to say. */
+const refusalAdvice: { next_action?: string } = {};
 /** What was asked, so an error's next step can name this game's folder and state file. */
 const invocation: {
   command: string;
@@ -652,12 +665,25 @@ async function main(): Promise<void> {
         force: values.force === true,
       });
       const conflicts = pulled.plan.conflicts;
+      // A last sync of another folder says nothing about who changed these files.
+      const lastSync =
+        handle.files !== undefined && handle.directory !== folder
+          ? (handle.directory ?? "unknown")
+          : undefined;
       handle.files = pulled.files;
       handle.media = pulled.media;
       handle.directory = folder;
-      // A conflicted pull keeps the old version: update stays blocked until the
-      // agent merges and names the version it merged against.
-      if (conflicts.length === 0) handle.content_version = game.content_version;
+      // A conflicted pull keeps the old version, and is remembered: update stays
+      // blocked until the agent merges and names the version it merged against,
+      // even when the saved version is already Rosebud's (a game just connected).
+      if (conflicts.length === 0) {
+        handle.content_version = game.content_version;
+        delete handle.pull_conflicts;
+      } else
+        handle.pull_conflicts = {
+          content_version: game.content_version,
+          paths: conflicts.map(({ path }) => path),
+        };
       await saveState(statePath, handle);
       output({
         project_id: handle.project_id,
@@ -684,6 +710,7 @@ async function main(): Promise<void> {
           skipped: pulled.skipped,
           remoteCopies,
           version: game.content_version,
+          lastSync,
         }),
       });
       return;
@@ -705,6 +732,31 @@ async function main(): Promise<void> {
         "version_required",
         "Run status after approval to establish this connection's initial version.",
       );
+    const flags = gameFlags(directory, value("state"));
+    // Without an explicit version, release only the folder the last sync knows.
+    if (
+      value("expected-version") === undefined &&
+      directory !== undefined &&
+      handle.directory !== undefined &&
+      resolve(directory) !== handle.directory
+    ) {
+      refusalAdvice.next_action = `Updating from ${directory} would release its files as they are and undo what the last sync brought into ${quoted(handle.directory)}. Run \`rosebud pull ${flags}\` first, then update; or, to release this folder as it is, run \`rosebud update ${flags} --expected-version ${expectedVersion}\`.`;
+      throw inputError(
+        "directory_mismatch",
+        `This game's last sync was with ${handle.directory}, not ${resolve(directory)}.`,
+      );
+    }
+    if (value("expected-version") === undefined && handle.pull_conflicts) {
+      const { paths, content_version: pulled } = handle.pull_conflicts;
+      refusalAdvice.next_action = `Resolve them as that pull's next_action said, then run \`rosebud update ${flags} --expected-version ${pulled}\` to release the result. A pull that reports no conflicts also lifts this.`;
+      throw inputError(
+        "pull_conflicts",
+        `The last pull left ${paths.length === 1 ? "a conflict" : `${paths.length} conflicts`} unresolved: ${paths
+          .slice(0, 10)
+          .map(quoted)
+          .join(", ")}${paths.length > 10 ? ", …" : ""}.`,
+      );
+    }
     const knownMedia = new Set(handle.media ?? []);
     // Rosebud holds these as text, whatever their extension (a Rosie-written icon.svg).
     const knownText = new Set(
@@ -765,6 +817,7 @@ async function main(): Promise<void> {
       });
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;
+      delete handle.pull_conflicts;
       remember(handle, release, directory);
       await saveState(statePath, handle);
       delete credentials.pending;
@@ -1456,9 +1509,10 @@ main().catch((error: unknown) => {
         );
   const details = apiDetails(known);
   const action =
-    known.kind === "api" || known.code === "pending_operation"
+    refusalAdvice.next_action ??
+    (known.kind === "api" || known.code === "pending_operation"
       ? nextAction(known, details)
-      : undefined;
+      : undefined);
   process.stderr.write(
     `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...details, ...(action ? { next_action: action } : {}), ...errorContext } })}\n`,
   );

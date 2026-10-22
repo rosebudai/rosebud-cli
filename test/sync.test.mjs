@@ -1064,6 +1064,20 @@ test("pull into another folder than the last sync's writes every file there", as
   const back = await run(root, ["pull", "--directory", "dist"]);
   assert.deepEqual(back.data.written, ["game.js"]);
   assert.equal(back.data.status, "synced");
+  // A file that differs there is a conflict, but no one can say it changed on both sides.
+  await writeFile(join(root, "dist/index.html"), "something else");
+  await mkdir(join(root, "third"));
+  await writeFile(join(root, "third/index.html"), "something else");
+  const third = await run(root, ["pull", "--directory", "third"]);
+  assert.deepEqual(
+    third.data.conflicts.map((c) => [c.path, c.reason]),
+    [["index.html", "both_changed"]],
+  );
+  assert.match(
+    third.data.next_action,
+    /^These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them \(last: `[^`]*dist`\): `index\.html`\./,
+  );
+  assert.doesNotMatch(third.data.next_action, /changed both here/);
 });
 
 test("files deleted here are reported, --force restores them, and the next update deletes them", async (t) => {
@@ -1103,6 +1117,16 @@ test("files deleted here are reported, --force restores them, and the next updat
   const again = await run(root, ["pull", "--directory", "dist"]);
   assert.deepEqual(again.data.missing_locally, ["art.js", "game.js"]);
   assert.match(again.data.next_action, /2 files Rosebud has are missing here/);
+  // Beside a conflict, the restore hint says what else --force does.
+  await writeFile(join(root, "dist/index.html"), "mine");
+  game.edit({ text: { "index.html": "rosie's" } });
+  const both = await run(root, ["pull", "--directory", "dist"]);
+  assert.match(
+    both.data.next_action,
+    /`rosebud pull --directory dist --force` restores them, though it also settles the conflicts above for Rosebud, discarding your edits to those files\./,
+  );
+  await writeFile(join(root, "dist/index.html"), "rosie's");
+  assert.equal((await run(root, ["pull", "--directory", "dist"])).code, 0);
   const update = await run(root, ["update", "--directory", "dist"]);
   assert.equal(update.code, 0, JSON.stringify(update.error));
   assert.deepEqual([...game.text.keys()], ["index.html"]);
@@ -1133,7 +1157,7 @@ test("pull keeps conflicting local edits, saves Rosebud's copy beside the state,
   assert.equal((await handle(root)).content_version, published);
   assert.equal(
     (await run(root, ["update", "--directory", "dist"])).error.code,
-    "version_conflict",
+    "pull_conflicts",
   );
   // Asking again must not forget the conflict and let update overwrite Rosie's edit.
   const again = await run(root, ["pull", "--directory", "dist"]);
@@ -1155,6 +1179,129 @@ test("pull keeps conflicting local edits, saves Rosebud's copy beside the state,
   assert.equal(game.text.get("index.html"), "mine + rosie's");
   const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
   assert.equal(forced.data.status, "synced");
+});
+
+/** Forget what a handle knew of the files and version, as for a game connected with --project. */
+async function adopted(root) {
+  const state = join(root, ".rosebud/project.json");
+  const saved = JSON.parse(await readFile(state, "utf8"));
+  for (const key of ["content_version", "files", "media", "directory"])
+    delete saved[key];
+  await writeFile(state, JSON.stringify(saved));
+}
+
+test("after a pull with conflicts, a plain update is refused even when the saved version is current", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+  });
+  // A game the agent didn't publish from here: status saves Rosebud's current version.
+  game.edit({ text: { "game.js": "rosie's" } });
+  await adopted(root);
+  assert.equal((await run(root, ["status"])).code, 0);
+  await writeFile(join(root, "dist/game.js"), "mine");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.data.status, "conflicts");
+  assert.equal((await handle(root)).content_version, game.version);
+  const refused = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(refused.code, 2);
+  assert.equal(refused.error.code, "pull_conflicts");
+  assert.match(refused.error.message, /`game\.js`/);
+  assert.equal(
+    refused.error.next_action,
+    `Resolve them as that pull's next_action said, then run \`rosebud update --directory dist --expected-version ${game.version}\` to release the result. A pull that reports no conflicts also lifts this.`,
+  );
+  assert.equal(game.text.get("game.js"), "rosie's");
+  // Naming the version releases the merge, and clears the guard.
+  await writeFile(join(root, "dist/game.js"), "mine + rosie's");
+  const merged = await run(root, [
+    "update",
+    "--directory",
+    "dist",
+    "--expected-version",
+    game.version,
+  ]);
+  assert.equal(merged.code, 0, JSON.stringify(merged.error));
+  assert.equal((await handle(root)).pull_conflicts, undefined);
+  await writeFile(join(root, "dist/game.js"), "v3");
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 0);
+  // A pull without conflicts lifts it too.
+  game.edit({ text: { "game.js": "rosie again" } });
+  await writeFile(join(root, "dist/game.js"), "mine again");
+  await run(root, ["pull", "--directory", "dist"]);
+  assert.ok((await handle(root)).pull_conflicts);
+  const forced = await run(root, ["pull", "--directory", "dist", "--force"]);
+  assert.equal(forced.data.status, "synced");
+  assert.equal((await handle(root)).pull_conflicts, undefined);
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 0);
+});
+
+test("a game connected with --project whose names collide here is never released by a plain update", async (t) => {
+  if (!(await caseInsensitiveDisk(t)))
+    return t.skip("this file system is case-sensitive");
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.edit({ text: { "Foo.js": "UPPER", "foo.js": "lower" } });
+  await adopted(root);
+  assert.equal((await run(root, ["status"])).code, 0);
+  await rm(join(root, "dist"), { recursive: true });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.deepEqual(
+    pull.data.conflicts.map((c) => c.reason),
+    ["name_collision", "name_collision"],
+  );
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.error.code, "pull_conflicts");
+  assert.deepEqual([...game.text.keys()].sort(), [
+    "Foo.js",
+    "foo.js",
+    "index.html",
+  ]);
+});
+
+test("an update from another folder than the last sync's needs a pull there or --expected-version", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "game.js": "1",
+  });
+  game.edit({ text: { "game.js": "rosie's" } });
+  assert.equal((await run(root, ["pull", "--directory", "dist"])).code, 0);
+  await mkdir(join(root, "other"));
+  await writeFile(join(root, "other/index.html"), "old build");
+  const refused = await run(root, ["update", "--directory", "other"]);
+  assert.equal(refused.code, 2);
+  assert.equal(refused.error.code, "directory_mismatch");
+  assert.match(refused.error.message, /dist/);
+  assert.match(
+    refused.error.next_action,
+    /`rosebud pull --directory other` first/,
+  );
+  assert.match(
+    refused.error.next_action,
+    new RegExp(`--expected-version ${game.version}`),
+  );
+  assert.equal(game.text.get("game.js"), "rosie's");
+  // Pulling there first makes it the folder of the last sync.
+  await rm(join(root, "other/index.html"));
+  const there = await run(root, ["pull", "--directory", "other"]);
+  assert.equal(there.data.status, "synced");
+  await writeFile(join(root, "other/index.html"), "new build");
+  const update = await run(root, ["update", "--directory", "other"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(game.text.get("game.js"), "rosie's");
+  // Or the agent says, by naming the version, that this folder is what it means to release.
+  await writeFile(join(root, "dist/index.html"), "from dist");
+  const named = await run(root, [
+    "update",
+    "--directory",
+    "dist",
+    "--expected-version",
+    (await handle(root)).content_version,
+  ]);
+  assert.equal(named.code, 0, JSON.stringify(named.error));
+  assert.match((await handle(root)).directory, /dist$/);
 });
 
 test("pull --force takes Rosebud's copies and moves the version on", async (t) => {
@@ -2513,7 +2660,14 @@ test("Rosebud names that this disk would store as one file are all refused, with
     assert.equal((await handle(root)).content_version, published);
   }
   const update = await run(root, ["update", "--directory", "dist"]);
-  assert.equal(update.error.code, "version_conflict");
+  assert.equal(update.error.code, "pull_conflicts");
+  assert.deepEqual([...game.text.keys()].sort(), [
+    "Foo.js",
+    "Scripts/a.js",
+    "foo.js",
+    "index.html",
+    "scripts/b.js",
+  ]);
 });
 
 // macOS stores names that differ only in Unicode form (é as one character or two) as one file.
