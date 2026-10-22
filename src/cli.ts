@@ -99,6 +99,7 @@ Make assets with the person's Rosebud credits:
   rosebud assets download <asset_id> --out <file>
 
 login returns a PRIVATE approval link; the human must approve before assets work.
+A login expires after 90 days without use; whoami shows its scopes and expires_at.
 --prompt fills the model's prompt input; --input sets any other input it lists
 (repeatable), and --input-json <file> supplies inputs as one JSON object.
 create quotes first, refuses a quote above --max-credits, then waits up to
@@ -969,7 +970,8 @@ async function assets(
       ...(maxCredits !== undefined ? { maxCredits: Number(maxCredits) } : {}),
     });
   } catch (error) {
-    if (unknownToken(error))
+    // An expired login keeps Rosebud's own message, which says what to do.
+    if (unknownToken(error) && (error as RosebudError).code !== "key_expired")
       throw new RosebudError(
         "Rosebud did not accept the saved login. Run rosebud whoami: a pending login still needs the person to approve its approval_url, and after revoked or expired, run rosebud login again.",
         {
@@ -1260,6 +1262,17 @@ interface ApiDetails {
   filename?: string;
   limit?: number;
   changed_paths?: string[] | null;
+  required_scope?: string;
+}
+/** The scope Rosebud says a request needs, from either error shape. */
+function requiredScope(body: JsonValue | undefined): string | undefined {
+  if (!isObject(body)) return undefined;
+  const scope = isObject(body.error)
+    ? body.error.required_scope
+    : body.required_scope;
+  return typeof scope === "string" && /^[a-z]+:[a-z]+$/.test(scope)
+    ? scope
+    : undefined;
 }
 /** Server-validated diagnostics worth showing; never the raw response body. */
 function apiDetails(error: RosebudError): ApiDetails {
@@ -1271,9 +1284,11 @@ function apiDetails(error: RosebudError): ApiDetails {
     Array.isArray(body)
   )
     return {};
+  const scope = requiredScope(body);
   const details = body.error;
+  // Gateway errors (`{detail, code}`) have no `error` key, but can name a scope.
   if (!details || typeof details !== "object" || Array.isArray(details))
-    return {};
+    return scope ? { required_scope: scope } : {};
   const { filename, limit, changed_paths: changed } = details;
   const paths = pathList(changed);
   const bytes = byteLimit(limit);
@@ -1283,6 +1298,7 @@ function apiDetails(error: RosebudError): ApiDetails {
       : {}),
     ...(bytes !== undefined ? { limit: bytes } : {}),
     ...(paths !== undefined ? { changed_paths: paths } : {}),
+    ...(scope ? { required_scope: scope } : {}),
   };
 }
 /** A limit as a number: servers before ENG-4832 sent it as a string of digits. */
@@ -1347,6 +1363,10 @@ function nextAction(
       return "Run the same command again; it declares the media in a new upload session.";
     case "sync_unavailable":
       return "This Rosebud server can't read files back or take file-by-file uploads yet.";
+    case "key_expired":
+      return "This login expired after 90 days without use. Run `rosebud login` and give the new approval_url to the person.";
+    case "insufficient_scope":
+      return `This login wasn't granted ${details.required_scope === undefined ? "that permission" : quoted(details.required_scope)}. Run \`rosebud logout\`, then \`rosebud login\`, and give the new approval_url to the person.`;
     default:
       return undefined;
   }

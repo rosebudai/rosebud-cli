@@ -155,7 +155,7 @@ Generate game art, skyboxes, 3D models, sound effects and music with the person'
 rosebud login --agent-client codex
 ```
 
-`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts until the person disconnects it in Rosebud or you run `rosebud logout`. It works with the person's assets and asset generation, paid from their credits, and `rosebud publish` puts new games in their account. It cannot change billing or manage the account. A publish with a login that still waits for approval fails with `login_pending`; approve it, or run `rosebud logout` to publish with a claim link instead. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
+`login` returns a private `approval_url`. Give it to the person, who signs in and approves this agent once; there is no API key to copy. A pending login expires after 30 minutes. `rosebud whoami` reports whether the login is pending, active, expired or revoked, and the person's credit balance. An approved login lasts while it is used: it expires after 90 days without use, and ends when the person disconnects it in Rosebud or you run `rosebud logout`. `rosebud whoami` shows its `scopes` and `expires_at`. After `key_expired`, run `rosebud login` again; after `insufficient_scope` (which names the `required_scope`), run `rosebud logout`, then `rosebud login`. It works with the person's assets and asset generation, paid from their credits, and `rosebud publish` puts new games in their account. It cannot change billing or manage the account. A publish with a login that still waits for approval fails with `login_pending`; approve it, or run `rosebud logout` to publish with a claim link instead. `login` reports an existing pending or active login instead of replacing it; run `rosebud logout` first to switch accounts.
 
 Choose a model, check the price, then make the asset:
 
@@ -177,26 +177,26 @@ The login is stored with the other credentials, separate from project connection
 
 ## CLI reference
 
-| Command                                                           | Result                                                                   |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `rosebud publish --directory ./dist`                              | Creates a new game and saves its project handle.                         |
-| `rosebud connect`                                                 | Requests owner approval for the saved project.                           |
-| `rosebud connect --project <id>`                                  | Requests a new connection to an existing game.                           |
-| `rosebud status`                                                  | Reports pending, active, revoked or expired access and content versions. |
-| `rosebud pull --directory ./game`                                 | Brings the game's current files, including Rosebud edits, into a folder. |
-| `rosebud update --directory ./dist`                               | Releases a changed build to the saved project and play URL.              |
-| `rosebud disconnect`                                              | Revokes this agent's connection; the published game stays playable.      |
-| `rosebud login`                                                   | Requests the person's approval to make assets with their credits.        |
-| `rosebud whoami`                                                  | Reports the login's status and the person's credit balance.              |
-| `rosebud logout`                                                  | Revokes the login and removes it from this machine.                      |
-| `rosebud assets models`                                           | Lists models with their inputs, prices and licenses.                     |
-| `rosebud assets quote --model <id> --prompt <text>`               | Checks inputs and prices an asset without charging.                      |
-| `rosebud assets create --model <id> --prompt <text> --out <file>` | Makes an asset, waits for it and saves the file.                         |
-| `rosebud assets status <job_id>`                                  | Reports a job's progress and, when done, its asset.                      |
-| `rosebud assets list`                                             | Lists the person's assets, newest first.                                 |
-| `rosebud assets download <asset_id> --out <file>`                 | Saves an existing asset's file.                                          |
-| `rosebud --help`                                                  | Shows commands and options.                                              |
-| `rosebud --version`                                               | Prints the installed CLI version.                                        |
+| Command                                                           | Result                                                                      |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `rosebud publish --directory ./dist`                              | Creates a new game and saves its project handle.                            |
+| `rosebud connect`                                                 | Requests owner approval for the saved project.                              |
+| `rosebud connect --project <id>`                                  | Requests a new connection to an existing game.                              |
+| `rosebud status`                                                  | Reports pending, active, revoked or expired access and content versions.    |
+| `rosebud pull --directory ./game`                                 | Brings the game's current files, including Rosebud edits, into a folder.    |
+| `rosebud update --directory ./dist`                               | Releases a changed build to the saved project and play URL.                 |
+| `rosebud disconnect`                                              | Revokes this agent's connection; the published game stays playable.         |
+| `rosebud login`                                                   | Requests the person's approval to make assets with their credits.           |
+| `rosebud whoami`                                                  | Reports the login's status, scopes, expiry and the person's credit balance. |
+| `rosebud logout`                                                  | Revokes the login and removes it from this machine.                         |
+| `rosebud assets models`                                           | Lists models with their inputs, prices and licenses.                        |
+| `rosebud assets quote --model <id> --prompt <text>`               | Checks inputs and prices an asset without charging.                         |
+| `rosebud assets create --model <id> --prompt <text> --out <file>` | Makes an asset, waits for it and saves the file.                            |
+| `rosebud assets status <job_id>`                                  | Reports a job's progress and, when done, its asset.                         |
+| `rosebud assets list`                                             | Lists the person's assets, newest first.                                    |
+| `rosebud assets download <asset_id> --out <file>`                 | Saves an existing asset's file.                                             |
+| `rosebud --help`                                                  | Shows commands and options.                                                 |
+| `rosebud --version`                                               | Prints the installed CLI version.                                           |
 
 Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Each file upload also gets one extra second per 32 KiB on top of `--timeout-ms`, so large media has time to finish. Rosebud is the default destination, and subsequent commands use the saved project connection.
 

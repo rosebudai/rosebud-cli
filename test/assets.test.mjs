@@ -64,6 +64,9 @@ async function rosebud(t) {
     busyPolls: 0,
     publishes: [],
     statusChecks: [],
+    scopes: ["assets:read", "assets:write", "games:write"],
+    keyExpiresAt: "2031-01-20T12:00:00Z",
+    refuse: null,
   };
   const job = (id) => {
     const row = api.jobs.get(id);
@@ -98,6 +101,16 @@ async function rosebud(t) {
     }
     if (path === "/api/developer/projects/import/") {
       api.publishes.push(req.headers.authorization);
+      if (api.refuse) {
+        const { status, code, message, scope } = api.refuse;
+        const error = {
+          code,
+          message,
+          ...(scope ? { required_scope: scope } : {}),
+        };
+        json(res, { error }, status);
+        return;
+      }
       if (api.login === "pending") {
         const error = { code: "login_pending", message: "Approve first." };
         json(res, { error }, 403);
@@ -168,13 +181,23 @@ async function rosebud(t) {
         status: api.login,
         client: "codex",
         name: "Moon Garden agent",
-        expires_at: active ? null : "2030-01-01T00:30:00Z",
+        scopes: api.scopes,
+        expires_at: active ? api.keyExpiresAt : "2030-01-01T00:30:00Z",
         account: active ? { display_name: "Mei", balance: 5000 } : null,
       });
       return;
     }
     if (api.login !== "active") {
       json(res, { detail: "Invalid key.", code: "invalid_key" }, 401);
+      return;
+    }
+    if (api.refuse) {
+      const { status, code, message, scope } = api.refuse;
+      json(
+        res,
+        { detail: message, code, ...(scope ? { required_scope: scope } : {}) },
+        status,
+      );
       return;
     }
     if (path === "/api/v1/asset-quotes/" && api.throttle.length) {
@@ -587,4 +610,111 @@ test("a publish with a login still waiting for approval saves nothing", async (t
   assert.equal(refused.code, 3);
   assert.equal(refused.error.code, "login_pending");
   await assert.rejects(stat(join(root, ".rosebud", "project.json")));
+});
+
+test("whoami shows the login's scopes and expiry as Rosebud returns them", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.scopes = ["assets:read", "games:write"];
+  const active = await cli(root, api, ["whoami"]);
+  assert.equal(active.code, 0, active.stderr);
+  assert.deepEqual(active.data.scopes, ["assets:read", "games:write"]);
+  assert.equal(active.data.expires_at, "2031-01-20T12:00:00Z");
+
+  // An expired login is reported as such, and logging in again starts a new one.
+  api.login = "expired";
+  const expired = await cli(root, api, ["whoami"]);
+  assert.equal(expired.code, 0, expired.stderr);
+  assert.equal(expired.data.status, "expired");
+  const again = await cli(root, api, ["login"]);
+  assert.equal(again.data.status, "pending");
+  assert.equal(api.logins.length, 2);
+});
+
+test("an expired login tells the agent to log in again", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.refuse = {
+    status: 401,
+    code: "key_expired",
+    message:
+      "This login expired after 90 days without use. Run rosebud login again.",
+  };
+  const listed = await cli(root, api, ["assets", "list"]);
+  assert.equal(listed.code, 3);
+  assert.equal(listed.error.code, "key_expired");
+  // Rosebud's own message survives, rather than the generic "did not accept" one.
+  assert.match(listed.error.message, /90 days without use/);
+  assert.match(listed.error.next_action, /`rosebud login`/);
+  assert.doesNotMatch(listed.error.next_action, /logout/);
+
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "key_expired");
+  assert.match(published.error.next_action, /`rosebud login`/);
+});
+
+test("a login without a needed scope names it and says to log in again", async (t) => {
+  const { root, api } = await loggedIn(t);
+  api.refuse = {
+    status: 403,
+    code: "insufficient_scope",
+    message: "This key lacks the assets:write scope.",
+    scope: "assets:write",
+  };
+  const quoted = await cli(root, api, [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ]);
+  assert.equal(quoted.code, 3);
+  assert.equal(quoted.error.code, "insufficient_scope");
+  assert.equal(quoted.error.required_scope, "assets:write");
+  assert.match(
+    quoted.error.next_action,
+    /`rosebud logout`, then `rosebud login`/,
+  );
+  assert.match(quoted.error.next_action, /assets:write/);
+
+  // The publishing endpoints answer in their own shape, with the same result.
+  await game(root);
+  const published = await cli(root, api, ["publish", "--directory", "dist"]);
+  assert.equal(published.code, 3);
+  assert.equal(published.error.code, "insufficient_scope");
+  assert.equal(published.error.required_scope, "assets:write");
+  assert.match(
+    published.error.next_action,
+    /`rosebud logout`, then `rosebud login`/,
+  );
+});
+
+test("a scope name that Rosebud does not send in the expected form is never repeated", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const quote = [
+    "assets",
+    "quote",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "moss",
+  ];
+  api.refuse = {
+    status: 403,
+    code: "insufficient_scope",
+    message: "This key lacks a scope.",
+    scope: "assets:write`; echo hi",
+  };
+  const odd = await cli(root, api, quote);
+  assert.equal(odd.code, 3);
+  assert.equal(odd.error.required_scope, undefined);
+  assert.doesNotMatch(odd.error.next_action, /echo/);
+  assert.match(odd.error.next_action, /that permission/);
+  assert.match(odd.error.next_action, /`rosebud logout`, then `rosebud login`/);
+
+  api.refuse = { ...api.refuse, scope: undefined };
+  const bare = await cli(root, api, quote);
+  assert.equal(bare.error.required_scope, undefined);
+  assert.match(bare.error.next_action, /that permission/);
 });

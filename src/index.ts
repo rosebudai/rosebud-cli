@@ -169,6 +169,8 @@ export interface LoginStatus {
   login_id: string | null;
   status: "pending" | "active" | "expired" | "revoked";
   expires_at: string | null;
+  /** The scopes Rosebud enforces for this login; servers before ENG-4834 omit it. */
+  scopes?: string[];
   [key: string]: JsonValue;
 }
 export interface AssetModelInput {
