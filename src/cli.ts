@@ -150,6 +150,19 @@ function remember(handle: ProjectHandle, release: PreparedRelease): void {
     delete handle.media;
   }
 }
+/** A handle's manifest is plain data; anything else is corrupt or hand-edited. */
+function malformedManifest(handle: ProjectHandle): boolean {
+  const { files, media } = handle as { files?: unknown; media?: unknown };
+  return (
+    (files !== undefined &&
+      !(
+        isObject(files) &&
+        Object.values(files).every((v) => typeof v === "string")
+      )) ||
+    (media !== undefined &&
+      !(Array.isArray(media) && media.every((v) => typeof v === "string")))
+  );
+}
 /** Ids that help recover from an error, added to its JSON. */
 const errorContext: { job_id?: string; asset_id?: string } = {};
 
@@ -253,7 +266,8 @@ async function main(): Promise<void> {
       handle &&
       (handle.version !== 1 ||
         typeof handle.api_base_url !== "string" ||
-        typeof handle.project_id !== "string")
+        typeof handle.project_id !== "string" ||
+        malformedManifest(handle))
     )
       throw inputError("state_format", "This project handle is not supported.");
     const configuredBase = value("api-base") ?? process.env.ROSEBUD_API_BASE;

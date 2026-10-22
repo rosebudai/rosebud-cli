@@ -371,9 +371,12 @@ test("a rerun after a lost response replays the release without uploading again"
     join(root, "dist/assets/big.bin"),
     Buffer.alloc(big.length, 9),
   );
+  const before = game.puts.length;
   game.loseNextRelease = true;
   const lost = await run(root, ["update", "--directory", "dist"]);
   assert.equal(lost.code, 4);
+  // The lost attempt staged the upload; the rerun must not stage it again.
+  assert.equal(game.puts.length, before + 1);
   const puts = game.puts.length,
     releases = game.releases;
   const rerun = await run(root, ["update", "--directory", "dist"]);
@@ -441,4 +444,30 @@ test("after a lost response, a changed media file is different input, not a reru
   const changed = await run(root, ["update", "--directory", "dist"]);
   assert.equal(changed.code, 2);
   assert.equal(changed.error.code, "pending_operation");
+});
+
+test("a handle whose files or media are malformed is refused", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  const good = await handle(root);
+  const state = join(root, ".rosebud/project.json");
+  for (const bad of [
+    { files: [] },
+    { files: null },
+    { files: "x" },
+    { files: { "index.html": 1 } },
+    { media: "x" },
+    { media: null },
+    { media: {} },
+    { media: [1] },
+  ]) {
+    await writeFile(state, JSON.stringify({ ...good, ...bad }));
+    const refused = await run(root, ["status"]);
+    assert.equal(refused.error.code, "state_format", JSON.stringify(bad));
+  }
+  await writeFile(state, JSON.stringify(good));
+  assert.equal((await run(root, ["status"])).code, 0);
 });
