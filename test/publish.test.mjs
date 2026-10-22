@@ -205,14 +205,14 @@ test("input errors explain the correction before any HTTP request", async (t) =>
 test("packaging refuses unsupported files, hidden files and links instead of dropping them", async (t) => {
   const remote = await api(t, (_req, res) => json(res, success));
   const client = new Rosebud({ apiBaseUrl: remote.base });
-  for (const [name, code] of [
-    ["source.ts", "unsupported_file"],
-    [".env", "unsafe_path"],
-    ["credentials.json", "excluded_file"],
+  for (const [name, code, content] of [
+    ["tool.exe", "unsupported_file", Buffer.from([0, 1, 2])],
+    [".env", "unsafe_path", "private"],
+    ["credentials.json", "excluded_file", "private"],
   ]) {
     const root = await directory(t, {
       "index.html": "<p>Game</p>",
-      [name]: "private",
+      [name]: content,
     });
     await assert.rejects(
       client.publish({ directory: root }),
@@ -226,6 +226,30 @@ test("packaging refuses unsupported files, hidden files and links instead of dro
     (e) => e.code === "unsupported_input",
   );
   assert.equal(remote.requests.length, 0);
+});
+
+test("Markdown notes publish with the game", async (t) => {
+  const root = await directory(t, {
+    "index.html": "<p>Game</p>",
+    "AGENTS.md": "# Notes",
+  });
+  const remote = await api(t, async (req, res, bytes) => {
+    const form = await new Response(bytes, {
+      headers: { "content-type": req.headers["content-type"] },
+    }).formData();
+    const files = unzipSync(
+      new Uint8Array(await form.get("bundle").arrayBuffer()),
+    );
+    assert.equal(strFromU8(files["AGENTS.md"]), "# Notes");
+    json(res, success);
+  });
+  assert.deepEqual(
+    await new Rosebud({ apiBaseUrl: remote.base }).publish({
+      directory: root,
+    }),
+    success,
+  );
+  assert.equal(remote.requests.length, 1);
 });
 
 test("archive and entry bounds fail before upload", async (t) => {
