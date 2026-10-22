@@ -10,7 +10,7 @@ Use the `rosebud` command to publish. Build and test the game locally, then publ
 
 The CLI handles packaging, credentials, the saved project handle and update operation IDs. Run commands from the same project directory, or consistently pass `--state /private/path/project.json`. Keep terminal results private because they can contain claim and approval links.
 
-To make art, audio or 3D models for the game, run `rosebud login` once and follow [Make assets](#make-assets).
+To keep working on a game the person made in the Rosebud editor, follow [Work on a game made in Rosebud](#work-on-a-game-made-in-rosebud). To make art, audio or 3D models for the game, run `rosebud login` once and follow [Make assets](#make-assets).
 
 ## Quickstart
 
@@ -66,6 +66,28 @@ rosebud connect --state .rosebud/new-project.json
 
 Use that new state file for subsequent `status` and `update` commands, and claim the new game within its one-hour window. This creates a new project and play link; it cannot restore the deleted one. Choose a different unused state filename if `new-project.json` already exists.
 
+## Work on a game made in Rosebud
+
+To change a game the person built in the Rosebud editor, connect to it, bring its current files into a folder, edit them and update:
+
+```sh
+rosebud connect --project <project_id>
+# The person opens the approval_url, signs in and approves.
+rosebud status
+rosebud pull --directory ./game
+# Edit the files in ./game.
+rosebud update --directory ./game
+```
+
+1. Find the project ID in the editor's address: `https://rosebud.ai/edit/<project_id>`.
+2. `connect` returns a private `approval_url`. Give it to the person, who signs in and approves access to this one game.
+3. `rosebud status` reports `active` once they have, and saves the game's current version.
+4. `rosebud pull --directory ./game` writes the game's current files, including edits made in Rosebud, into `./game`. Text files and media both come down; the folder is created if needed.
+5. Edit the files. Games made in Rosie include `AGENTS.md` and other notes worth reading before you change anything.
+6. `rosebud update --directory ./game` releases your version to the same link. Files Rosebud already has are not uploaded again.
+
+Reading files back needs the game owner's plan to include code download. Without it, `pull` fails with `plan_required` (exit 3) while `publish` and `update` still work: ask the person what they changed in Rosebud before you update, so you don't replace their edits.
+
 ## Metadata and context
 
 `publish` and `update` accept `--title` (1–255 characters), `--description` (0–4000 characters) and an optional `--thumbnail` file path. `--name` remains a title alias; conflicting title/name values are rejected. Omitted update metadata is preserved. Changing a title retains the original play URL.
@@ -98,13 +120,28 @@ The CLI reports its own version and interface automatically. Other context is ex
 
 The CLI remembers the last accepted content version and records an operation ID before sending an update. Rosebud validates the complete bundle and commits the current and published revisions together. A failed release leaves the previous game playable; an identical retry recovers the original result.
 
-Browser edits and other agent releases can make your saved version stale. `rosebud status` shows the remote and saved versions. Reconcile those changes with your local source, then explicitly accept the remote version when updating:
+Browser edits and other agent releases can make your saved version stale. `rosebud status` shows the remote and saved versions. An update against a stale version is refused with `version_conflict` (exit 3). Its error lists what changed in `changed_paths`:
+
+| `changed_paths` | Meaning                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
+| A list of paths | Rosebud changed these files since your last sync (at most 2,000 are listed). |
+| `[]`            | Only the game's title, description or cover changed; no file did.            |
+| `null`          | Rosebud can't tell which files changed.                                      |
+| Missing         | This Rosebud server doesn't report changed files.                            |
+
+`next_action` says what to do, naming up to ten paths. To bring Rosebud's changes in, run `rosebud pull --directory ./game`. Pull takes the files Rosebud changed, removes the ones it deleted and keeps your own edits, including files only you changed. A file changed on both sides is a conflict: pull leaves your copy in place, lists it under `conflicts` and saves Rosebud's copy in a `.remote` folder beside the state file (`.rosebud/project.remote/` for the default state). That folder sits outside your build folder, so `update` never uploads it. Merge each conflict into your file, keeping both changes. Pull does not move your saved version while conflicts remain, so `update` stays refused until you say which version you merged against:
 
 ```sh
-rosebud update --directory ./dist --expected-version <version-from-status>
+rosebud update --directory ./game --expected-version <content_version from pull or status>
 ```
 
-There is no automatic source merge or force overwrite. Active Rosebud generation blocks publication. After an interrupted update, rerun the identical command and input. If the input changed while the outcome was uncertain, check status and reconcile before submitting another release.
+For a conflict that only touched the title, description or cover, run `rosebud status` and pass its `content_version` the same way.
+
+`rosebud pull --force` settles conflicts the other way: it takes Rosebud's version of each conflicted file, discarding your edit to it. It never touches changes made only on your side; those still go up with your next update. `rosebud update` has no force option and never merges for you.
+
+Active Rosebud generation blocks publication. After an interrupted update, rerun the identical command and input. If the input changed while the outcome was uncertain, check status and reconcile before submitting another release.
+
+When Rosebud is too busy to start a request it answers `busy` (HTTP 503) and changes nothing. The CLI reports it as a rejection (exit 3, outcome `rejected`) with `retry_after_seconds` when Rosebud says how long to wait. Run the same command again after that long: an update's saved operation is kept, so the rerun sends exactly the same release. A first `publish` refused as busy created nothing and is safe to run again.
 
 First publication has a separate limit: a lost response may leave a created game, and a fresh `publish` may create a duplicate. Requests are not automatically retried or redirected.
 
@@ -146,6 +183,7 @@ The login is stored with the other credentials, separate from project connection
 | `rosebud connect`                                                 | Requests owner approval for the saved project.                           |
 | `rosebud connect --project <id>`                                  | Requests a new connection to an existing game.                           |
 | `rosebud status`                                                  | Reports pending, active, revoked or expired access and content versions. |
+| `rosebud pull --directory ./game`                                 | Brings the game's current files, including Rosebud edits, into a folder. |
 | `rosebud update --directory ./dist`                               | Releases a changed build to the saved project and play URL.              |
 | `rosebud disconnect`                                              | Revokes this agent's connection; the published game stays playable.      |
 | `rosebud login`                                                   | Requests the person's approval to make assets with their credits.        |
@@ -160,9 +198,9 @@ The login is stored with the other credentials, separate from project connection
 | `rosebud --help`                                                  | Shows commands and options.                                              |
 | `rosebud --version`                                               | Prints the installed CLI version.                                        |
 
-Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Rosebud is the default destination, and subsequent commands use the saved project connection.
+Uploads accept exactly one of `--directory` and `--zip`. Common options are `--state` and `--timeout-ms` (default 120000; for `assets create` it bounds the whole wait, default 600000). Each file upload also gets one extra second per 32 KiB on top of `--timeout-ms`, so large media has time to finish. Rosebud is the default destination, and subsequent commands use the saved project connection.
 
-JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` when it reports them, so you know which file to fix. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. Uploads are never sent again. Exit codes:
+JSON results go to stdout; JSON errors go to stderr. The `error` object includes `message`, `kind`, `code`, `outcome` (`not_sent`, `rejected` or `unknown`) and, when available, HTTP `status`. Rejected uploads also include the server's `filename` and `limit` (always a number) when it reports them, so you know which file to fix. Many errors add a `next_action` saying what to do about them, such as `version_conflict` with its `changed_paths`, `release_upload_limit` or `plan_required`. Asset errors include the `job_id` or `asset_id` once one is known. Asset commands that Rosebud throttles wait the time it asks for and send again, for up to a minute in all; a longer wait fails with code `throttled` and `retry_after_seconds`. Uploads are never sent again. Exit codes:
 
 | Exit | Meaning                                                                                 |
 | ---- | --------------------------------------------------------------------------------------- |
@@ -175,9 +213,21 @@ The CLI locks the state file during commands. If a process crashes, confirm it s
 
 ## Bundle and release limits
 
-UTF-8 `.txt` notices (including `.TXT`) and extensionless `LICENSE`, `LICENCE`, `NOTICE`, `COPYING`, `COPYRIGHT` and `AUTHORS` keep their original paths and contents. Do not discard license notices. Media paths must use canonical lowercase names under `assets/`; directory publishing explains required renames before sending.
+Root `index.html` is required. Text files (HTML, JavaScript, CSS, JSON, Markdown notes such as `AGENTS.md`, license notices) may have any name the Rosebud editor allows: UTF-8 content, no leading dot, none of `< > : " | ? *` or control characters in a name, and at most 500 characters in a path. They keep their original paths and contents, so do not discard license notices. Hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected.
 
-Root `index.html` is required. Supply browser-ready HTML, JS, CSS and JSON with local PNG/JPEG/WebP/SVG images, WAV/MP3/OGG audio, WOFF/WOFF2/TTF/OTF fonts, WASM, GLB/glTF models and binary model buffers (.bin). Limits: 10 MiB compressed, 50 MiB expanded and 500 entries including directories, subject to lower configured server bounds. Hidden files, credentials, dependency folders, links, unsafe paths and unsupported formats are rejected. Build locally before publishing, and keep developer tools and credentials outside the game build.
+Binary media goes under `assets/` with a canonical lowercase name (the CLI says which rename is needed before it sends anything). The media types are PNG/JPEG/WebP/SVG images, WAV/MP3/OGG audio, WOFF/WOFF2/TTF/OTF fonts, WASM, GLB/glTF models and binary model buffers (`.bin`).
+
+Media goes to Rosebud file by file, not inside the ZIP, so a game is no longer limited to 10 MiB of media:
+
+- Each file is at most 19 MiB.
+- A game has at most 2,000 files and 1 GiB in all.
+- Text files travel in one ZIP of at most 10 MiB compressed, 50 MiB expanded and 500 files.
+- Rosebud also limits how much new media one update adds at once. When an update goes over it, the error is `release_upload_limit` with the limit in bytes: update with part of the new media first, then again with the rest.
+- Files Rosebud already has, with the same path, size and MD5, are not uploaded again.
+
+While Rosebud checks a game's existing files it may answer a request for an upload session with `upload_retry`. The CLI asks again by itself, after the `Retry-After` it is given (one second without one, at most 10), up to 20 times; after that it stops with `next_action` to run the same command again. A Rosebud server without file-by-file uploads still takes a game as one ZIP, up to 10 MiB compressed. `--zip` uploads an archive you made as it is, within the same ZIP limits.
+
+Build locally before publishing, and keep developer tools and credentials outside the game build.
 
 Successful upload confirms import/publication, not gameplay. Open the returned play URL and test startup, controls, assets, audio and a full round. Published game files are public; keep secrets out of the bundle.
 

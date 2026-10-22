@@ -6,6 +6,11 @@
 - Make game assets with the person's Rosebud credits: `rosebud assets models`, `quote`, `create`, `status`, `list` and `download`. `create` refuses quotes above `--max-credits`, waits for the job, saves the file with `--out`, and resumes the same job when you rerun an interrupted command.
 - After `rosebud login` is approved, `rosebud publish` puts the game straight into the person's account and saves the update connection: no claim link and no `rosebud connect`.
 - Throttled asset requests wait out Rosebud's `Retry-After` and send again, for up to a minute; longer waits report `retry_after_seconds`.
+- `rosebud pull` brings a game's current files, including edits made in Rosebud, into a folder, keeping local edits and listing conflicts. It needs the owner's plan to include code download.
+- Media now uploads file by file, so games are no longer limited to a 10 MiB ZIP. The limits are 19 MiB per file, and 2,000 files and 1 GiB per game. Files Rosebud already has aren't uploaded again.
+- Text files may have any name the Rosebud editor allows, such as Markdown notes.
+- Update conflicts list the files that changed (`changed_paths`), and errors suggest a `next_action`.
+- A busy Rosebud (HTTP 503 `busy`) is reported as a rejection that changed nothing, with `retry_after_seconds`; rerunning an update sends the same operation. Upload sessions are asked for again automatically while Rosebud checks a game's existing files.
 
 ## 0.1.0
 

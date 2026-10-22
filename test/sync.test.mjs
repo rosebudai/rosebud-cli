@@ -1055,17 +1055,309 @@ test("pull on a plan without code download is refused as plan_required", async (
   assert.equal(pull.error.code, "plan_required");
 });
 
-test(
-  "pull on a plan without code download explains that publishing still works",
-  { todo: "Task 8" },
-  async (t) => {
-    const game = await fakeRosebud(t, { pro: false });
-    const root = await connected(t, game, { "index.html": "one" });
-    const pull = await run(root, ["pull", "--directory", "dist"]);
-    assert.match(pull.error.next_action, /updating still work/);
-    assert.doesNotMatch(pull.error.next_action, /\$|price|upgrade/i);
-  },
-);
+test("pull on a plan without code download explains that publishing still works", async (t) => {
+  const game = await fakeRosebud(t, { pro: false });
+  const root = await connected(t, game, { "index.html": "one" });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.match(pull.error.next_action, /updating still work/);
+  assert.doesNotMatch(pull.error.next_action, /\$|price|upgrade/i);
+});
+
+test("errors carry changed paths, numeric limits and what to do next", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.edit({ text: { "index.html": "rosie's", "AGENTS.md": "notes" } });
+  await writeFile(join(root, "dist/index.html"), "mine");
+  const conflict = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(conflict.code, 3);
+  assert.deepEqual(conflict.error.changed_paths, ["AGENTS.md", "index.html"]);
+  assert.match(conflict.error.next_action, /rosebud pull --directory/);
+  assert.equal(
+    conflict.error.next_action,
+    "Rosebud changed 2 file(s) since your last sync: `AGENTS.md`, `index.html`. Run `rosebud pull --directory dist` to bring them in, merge, then update again.",
+  );
+});
+
+test("a conflict says what to do whether Rosebud names files, none, or can't tell", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  // Only metadata changed in Rosebud: the version moves, no file does.
+  game.version = "f".repeat(64);
+  const metadata = await run(root, ["update", "--directory", "dist"]);
+  assert.deepEqual(metadata.error.changed_paths, []);
+  assert.equal(
+    metadata.error.next_action,
+    "Only the game's title, description or cover changed in Rosebud. Run `rosebud status` and pass its content_version as `--expected-version`.",
+  );
+  // A version Rosebud has no record of: it can't say what changed.
+  const unknown = await run(root, [
+    "update",
+    "--directory",
+    "dist",
+    "--expected-version",
+    "e".repeat(64),
+  ]);
+  assert.equal(unknown.error.changed_paths, null);
+  assert.equal(
+    unknown.error.next_action,
+    "Rosebud can't tell which files changed. Run `rosebud pull --directory dist` and compare before updating.",
+  );
+  // Many files: name ten and say there are more.
+  game.edit({
+    text: Object.fromEntries(
+      Array.from({ length: 12 }, (_, i) => [
+        `f${String(i + 1).padStart(2, "0")}.js`,
+        "x",
+      ]),
+    ),
+  });
+  const many = await run(root, [
+    "update",
+    "--directory",
+    "dist",
+    "--expected-version",
+    (await handle(root)).content_version,
+  ]);
+  assert.equal(many.error.changed_paths.length, 12);
+  assert.match(many.error.next_action, /^Rosebud changed 12 file\(s\)/);
+  assert.match(many.error.next_action, /`f10\.js`, …\./);
+  assert.doesNotMatch(many.error.next_action, /f11/);
+});
+
+test("a conflict's pull command names the same folder and state file the update used", async (t) => {
+  const game = await fakeRosebud(t);
+  const state = ".rosebud/b.json";
+  const root = await connected(
+    t,
+    game,
+    { "index.html": "one" },
+    { directory: "my game", state },
+  );
+  game.edit({ text: { "index.html": "rosie's" } });
+  const conflict = await run(root, [
+    "update",
+    "--directory",
+    "my game",
+    "--state",
+    state,
+  ]);
+  assert.match(
+    conflict.error.next_action,
+    /Run `rosebud pull --directory (['"])my game\1 --state \.rosebud\/b\.json` to bring them in/,
+  );
+  // With a ZIP there is no folder to name.
+  await writeFile(
+    join(root, "game.zip"),
+    zipSync({ "index.html": strToU8("z") }),
+  );
+  const zipped = await run(root, [
+    "update",
+    "--zip",
+    "game.zip",
+    "--state",
+    state,
+  ]);
+  assert.match(
+    zipped.error.next_action,
+    /`rosebud pull --directory <your game folder> --state \.rosebud\/b\.json`/,
+  );
+});
+
+test("refusals say what to do next, never mention pricing, and give limits as numbers", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/index.html"), "two");
+  const refused = async (status, error) => {
+    game.inject.push({ path: "/releases/", status, error });
+    return run(root, ["update", "--directory", "dist"]);
+  };
+  // Servers before ENG-4832 send the limit as a string.
+  const tooMuch = await refused(400, {
+    code: "release_upload_limit",
+    limit: "20971520",
+  });
+  assert.equal(tooMuch.code, 3);
+  assert.equal(tooMuch.error.limit, 20971520);
+  assert.equal(
+    tooMuch.error.next_action,
+    "This update adds more new media than Rosebud takes at once (limit: 20971520 bytes). Update with part of the new media first, then again with the rest; files Rosebud already has are not uploaded again.",
+  );
+  const numeric = await refused(400, {
+    code: "release_upload_limit",
+    limit: 5242880,
+  });
+  assert.equal(numeric.error.limit, 5242880);
+  assert.match(numeric.error.next_action, /\(limit: 5242880 bytes\)/);
+  const unsaid = await refused(400, { code: "release_upload_limit" });
+  assert.equal(unsaid.error.limit, undefined);
+  assert.doesNotMatch(unsaid.error.next_action, /limit:/);
+  for (const [status, code] of [
+    [409, "upload_stale"],
+    [410, "upload_expired"],
+    [404, "invalid_upload"],
+  ]) {
+    const result = await refused(status, { code });
+    assert.equal(
+      result.error.next_action,
+      "Run the same command again; it declares the media in a new upload session.",
+      code,
+    );
+  }
+  // An unrelated refusal gets no advice.
+  const plain = await refused(400, { code: "invalid_media" });
+  assert.equal(plain.error.next_action, undefined);
+  // A Rosebud without the file API is an uncertain outcome, still with advice.
+  game.sync = false;
+  const old = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(old.error.code, "sync_unavailable");
+  assert.equal(
+    old.error.next_action,
+    "This Rosebud server can't read files back or take file-by-file uploads yet.",
+  );
+  for (const result of [tooMuch, numeric, old])
+    assert.doesNotMatch(result.error.next_action, /\$|price|pricing|upgrade/i);
+});
+
+/** The saved pending operation's id, from the credential files under root. */
+async function pendingOperation(root) {
+  const dir = join(root, "credentials");
+  for (const name of await readdir(dir, { recursive: true })) {
+    let saved;
+    try {
+      saved = JSON.parse(await readFile(join(dir, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (saved.pending) return saved.pending.operation_id;
+  }
+  return undefined;
+}
+
+test("a busy Rosebud refused the update unapplied: wait, rerun, and the same operation is sent", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  await writeFile(join(root, "dist/index.html"), "two");
+  game.inject.push({
+    path: "/releases/",
+    status: 503,
+    headers: { "Retry-After": "7" },
+    error: { code: "busy" },
+  });
+  const busy = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(busy.code, 3);
+  assert.equal(busy.error.kind, "api");
+  assert.equal(busy.error.code, "busy");
+  assert.equal(busy.error.outcome, "rejected");
+  assert.equal(busy.error.status, 503);
+  assert.equal(busy.error.retry_after_seconds, 7);
+  assert.equal(
+    busy.error.next_action,
+    "Rosebud is busy. Run the same command again in 7 seconds; nothing was changed.",
+  );
+  assert.equal(game.releases, 1); // only the publish
+  const operation = await pendingOperation(root);
+  assert.ok(operation, "the pending operation survives a busy refusal");
+  const again = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(again.code, 0, JSON.stringify(again.error));
+  assert.deepEqual([...game.operations.keys()], [operation]);
+  assert.equal(await pendingOperation(root), undefined);
+  assert.equal(game.text.get("index.html"), "two");
+  // Only Rosebud's own busy answer is known not to have been applied.
+  await writeFile(join(root, "dist/index.html"), "three");
+  game.inject.push({ path: "/releases/", status: 503, error: { code: "x" } });
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+});
+
+test("a busy answer to a read is reported at once, not retried behind the scenes", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.inject.push({
+    path: "/connection/",
+    status: 503,
+    headers: { "Retry-After": "30" },
+    error: { code: "busy" },
+  });
+  const before = game.requests.length;
+  const busy = await run(root, ["status"]);
+  assert.equal(busy.code, 3);
+  assert.equal(busy.error.retry_after_seconds, 30);
+  assert.equal(game.requests.length - before, 1);
+});
+
+test("a first publish refused as busy created nothing and is safe to run again", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await folder(t, { "dist/index.html": "one" });
+  game.inject.push({
+    path: "/projects/import/",
+    status: 503,
+    error: { code: "busy" },
+  });
+  const args = ["publish", "--directory", "dist", "--api-base", game.base];
+  const busy = await run(root, args);
+  assert.equal(busy.code, 3);
+  assert.equal(busy.error.outcome, "rejected");
+  assert.equal(busy.error.retry_after_seconds, undefined);
+  assert.equal(
+    busy.error.next_action,
+    "Rosebud is busy. Run the same command again in a few seconds; no game was created, so publishing again is safe.",
+  );
+  assert.equal(game.releases, 0);
+  await assert.rejects(readFile(join(root, ".rosebud/project.json")));
+  assert.equal((await run(root, args)).code, 0);
+  assert.equal(game.releases, 1);
+});
+
+test("an upload session is asked again while Rosebud checks the game's existing files", async (t) => {
+  const game = await fakeRosebud(t, { uploadRetries: 3, uploadRetryAfter: 0 });
+  const root = await connected(t, game, { "index.html": "one" });
+  const sessions = () =>
+    game.requests.filter((r) => r.path === "/api/developer/uploads/").length;
+  // The publish had no media, so it made no session request.
+  assert.equal(sessions(), 0);
+  await mkdir(join(root, "dist/assets"));
+  await writeFile(join(root, "dist/assets/hero.png"), png);
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(sessions(), 4);
+  assert.deepEqual(game.puts, ["assets/hero.png"]);
+});
+
+test("after 20 upload_retry answers the CLI stops and says to run it again", async (t) => {
+  const game = await fakeRosebud(t, {
+    uploadRetries: 100,
+    uploadRetryAfter: 0,
+  });
+  const root = await folder(t, {
+    "dist/index.html": "one",
+    "dist/assets/hero.png": png,
+  });
+  const result = await run(root, [
+    "publish",
+    "--directory",
+    "dist",
+    "--api-base",
+    game.base,
+  ]);
+  assert.equal(result.code, 3);
+  assert.equal(result.error.code, "upload_retry");
+  assert.equal(result.error.outcome, "rejected");
+  assert.equal(result.error.retry_after_seconds, 0);
+  assert.equal(
+    result.error.next_action,
+    "Run the same command again; Rosebud is still checking this game's existing files.",
+  );
+  assert.equal(game.uploadRetries, 80);
+  assert.equal(game.releases, 0);
+});
+
+test("without a Retry-After, an upload_retry is asked again after one second", async (t) => {
+  const game = await fakeRosebud(t, { uploadRetries: 1 });
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  const started = Date.now();
+  await new Rosebud({ apiBaseUrl: game.base }).publish({ directory: root });
+  assert.ok(Date.now() - started >= 900);
+  assert.equal(game.uploadRetries, 0);
+});
 
 test("pull --force settles conflicts for Rosebud but never touches changes made only here", async (t) => {
   const game = await fakeRosebud(t);
@@ -1131,7 +1423,7 @@ test("next steps are copy-pasteable: they name --state and quote what needs it",
   assert.equal(synced.code, 0, JSON.stringify(synced.error));
   assert.match(
     synced.data.next_action,
-    /rosebud update --directory (['"])my game\1 --state \.rosebud\/b\.json\./,
+    /run `rosebud update --directory (['"])my game\1 --state \.rosebud\/b\.json`\./,
   );
   await writeFile(join(root, "my game/index.html"), "mine");
   game.edit({ text: { "index.html": "rosie's" } });
@@ -1156,7 +1448,10 @@ test("next steps are copy-pasteable: they name --state and quote what needs it",
   // The default state needs no flag.
   const plain = await connected(t, game, { "index.html": "x" });
   const unflagged = await run(plain, ["pull", "--directory", "dist"]);
-  assert.match(unflagged.data.next_action, /rosebud update --directory dist\./);
+  assert.match(
+    unflagged.data.next_action,
+    /run `rosebud update --directory dist`\./,
+  );
   assert.doesNotMatch(unflagged.data.next_action, /--state/);
 });
 

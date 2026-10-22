@@ -408,6 +408,7 @@ test("CLI uses the library contract and reserves stdout for the result", async (
   for (const key of Object.keys(success))
     assert.deepEqual(output[key], success[key]);
   assert.match(output.next_action, /connect/);
+  assert.match(output.next_action, /Run `rosebud connect` with/);
   assert.ok(output.next_action.includes(success.claim_expires_at));
 });
 
@@ -577,6 +578,39 @@ test("rejected uploads report the server's filename and limit but nothing else f
   assert.equal(error.filename, "assets/corrupt.png");
   assert.equal(error.limit, 10000);
   assert.equal(error.internal, undefined);
+  // Servers before ENG-4832 send the limit as a string; it is always shown as a number.
+  for (const [sent, shown] of [
+    ["134217728", 134217728],
+    ["000000000000001", 1],
+    ["12345678901234567", undefined],
+    ["12e3", undefined],
+    ["-5", undefined],
+    ["", undefined],
+    [1.5, undefined],
+    [1e21, undefined],
+    [null, undefined],
+  ]) {
+    const stub = await api(t, (_req, res) =>
+      json(
+        res,
+        { error: { code: "file_too_large", message: "Too big.", limit: sent } },
+        400,
+      ),
+    );
+    const odd = await cli([
+      "publish",
+      "--directory",
+      root,
+      "--api-base",
+      stub.base,
+    ]);
+    assert.equal(odd.code, 3);
+    assert.strictEqual(
+      JSON.parse(odd.stderr).error.limit,
+      shown,
+      JSON.stringify(sent),
+    );
+  }
 });
 
 test("credentials only travel over HTTPS, except to a local server", () => {

@@ -327,17 +327,23 @@ function apiError(
       ? { message: result.error.message, code: result.error.code }
       : { message: result.detail, code: result.code }
     : undefined;
+  const code = typeof detail?.code === "string" ? detail.code : "http_error";
+  // Backpressure refuses the request before anything runs, so unlike other 5xx
+  // answers its outcome is known: not applied.
+  const busy = status === 503 && code === "busy";
+  const waits =
+    status === 429 || busy || (status === 409 && code === "upload_retry");
   return new RosebudError(
     typeof detail?.message === "string"
       ? detail.message
       : `Rosebud API returned HTTP ${status}.`,
     {
       kind: "api",
-      code: typeof detail?.code === "string" ? detail.code : "http_error",
-      outcome: status >= 400 && status < 500 ? "rejected" : "unknown",
+      code,
+      outcome: (status >= 400 && status < 500) || busy ? "rejected" : "unknown",
       status,
       body: result,
-      ...(status === 429 && retryAfter && /^\d+$/.test(retryAfter)
+      ...(waits && retryAfter && /^\d{1,9}$/.test(retryAfter)
         ? { retryAfterSeconds: Number(retryAfter) }
         : {}),
     },
@@ -345,6 +351,8 @@ function apiError(
 }
 /** How long JSON requests wait out throttling, in total, before reporting it. */
 const throttleBudgetMs = 60_000;
+/** Asks for an upload session while Rosebud fingerprints the game's existing files. */
+const uploadRetryAttempts = 20;
 function downloadInterrupted(signal: AbortSignal): RosebudError {
   return new RosebudError(
     "The download was interrupted and no file was saved. Run the command again to retry it.",
@@ -576,22 +584,40 @@ export class Rosebud {
       projectPath(options.projectId);
       validateToken(options.token ?? "");
     } else if (options.token !== undefined) validateAccountToken(options.token);
-    const body = await this.request(
-      "/api/developer/uploads/",
-      "POST",
-      JSON.stringify({
-        files: options.files.map(({ path, size, md5 }) => ({
-          path,
-          size,
-          md5,
-        })),
-        ...(options.projectId !== undefined
-          ? { project_id: options.projectId.toLowerCase() }
-          : {}),
-      }),
-      options.token,
-      options.signal,
-    );
+    const request = JSON.stringify({
+      files: options.files.map(({ path, size, md5 }) => ({ path, size, md5 })),
+      ...(options.projectId !== undefined
+        ? { project_id: options.projectId.toLowerCase() }
+        : {}),
+    });
+    let body: Record<string, JsonValue>;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        body = await this.request(
+          "/api/developer/uploads/",
+          "POST",
+          request,
+          options.token,
+          options.signal,
+        );
+        break;
+      } catch (error) {
+        // Rosebud is still fingerprinting this game's existing files and every
+        // identical request moves it along, so ask again once it says to.
+        if (
+          !(error instanceof RosebudError) ||
+          error.kind !== "api" ||
+          error.code !== "upload_retry" ||
+          attempt === uploadRetryAttempts
+        )
+          throw error;
+        await sleep(
+          Math.min(error.retryAfterSeconds ?? 1, 10) * 1000,
+          undefined,
+          { signal: options.signal },
+        ).catch(() => undefined);
+      }
+    }
     // Every declared path comes back exactly once, linked or with a signed PUT.
     const declared = new Set(options.files.map((file) => file.path));
     const seen = new Set<string>();
@@ -1243,6 +1269,7 @@ export class Rosebud {
         // request is sent again once the window reopens. Uploads never are.
         const waitMs =
           error instanceof RosebudError &&
+          error.status === 429 &&
           error.retryAfterSeconds !== undefined &&
           !(body instanceof FormData)
             ? (error.retryAfterSeconds + 1) * 1000

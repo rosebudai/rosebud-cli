@@ -56,11 +56,14 @@ const help = `Rosebud CLI — publish and update browser-ready games
   rosebud publish --directory ./dist --title <title> --description <text>
   rosebud connect [--project <id>] [--agent-client codex]
   rosebud status
+  rosebud pull --directory ./game [--force]
   rosebud update --directory ./dist [--title <title>] [--thumbnail ./cover.png]
   rosebud disconnect
 
 Common: --state <file> (default .rosebud/project.json), --timeout-ms <ms>, --help, --version
 Uploads: exactly one --directory or --zip; optional --title, --description, --thumbnail.
+Media goes file by file: up to 19 MiB per file and 2,000 files / 1 GiB per game; text files
+travel in one ZIP of up to 10 MiB.
 Optional first-upload context: --context <JSON file>, --agent-client <client>.
 --name remains a title alias. Rosebud is the default destination; no configuration needed.
 
@@ -74,6 +77,11 @@ connect returns a PRIVATE sign-in
 link; the human must approve before update works. status checks approval without
 silently accepting remote edits. After reconciling a conflict, explicitly pass
 --expected-version <version from status> to update.
+
+pull brings the game's current files, including edits made in Rosebud, into a folder.
+Local edits are kept; files changed on both sides are listed as conflicts, with Rosebud's
+copy saved beside the state file. Reading files back needs the game owner's plan to include
+code download.
 
 Update retries reuse the saved operation ID for identical input. After an uncertain
 response, rerun the same update. Changed input requires explicit reconciliation.
@@ -160,6 +168,19 @@ function shellArg(arg: string): string {
     ? `"${arg}"`
     : `'${arg.replace(/'/g, `'\\''`)}'`;
 }
+/** The flags that aim a command at this game's folder and state file. */
+function gameFlags(
+  directory: string | undefined,
+  state: string | undefined,
+): string {
+  const folder =
+    directory === undefined ? "<your game folder>" : shellArg(directory);
+  return `--directory ${folder}${state === undefined ? "" : ` --state ${shellArg(state)}`}`;
+}
+/** A name from Rosebud, set in backticks so no sentence punctuation sticks to it. */
+function quoted(name: string): string {
+  return `\`${name.replace(/[\u0000-\u001f\u007f`]/gu, "?")}\``;
+}
 /** What to do after a pull, with commands that target this game and can be pasted as they are. */
 function pullAdvice(options: {
   directory: string;
@@ -170,7 +191,7 @@ function pullAdvice(options: {
   version: string;
 }): string {
   const { directory, state, conflicts, skipped, version } = options;
-  const flags = `--directory ${shellArg(directory)}${state === undefined ? "" : ` --state ${shellArg(state)}`}`;
+  const flags = gameFlags(directory, state);
   const has = (reason: PullPlan["conflicts"][number]["reason"]) =>
     conflicts.some((c) => c.reason === reason);
   const notes: string[] = [];
@@ -185,12 +206,12 @@ function pullAdvice(options: {
   const steps =
     conflicts.length === 0
       ? [
-          `${directory} now holds Rosebud's current version. Edit it, then run rosebud update ${flags}.`,
+          `${directory} now holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`,
         ]
       : [
-          `These files changed both here and in Rosebud: ${conflicts.map((c) => c.path).join(", ")}.`,
+          `These files changed both here and in Rosebud: ${conflicts.map((c) => quoted(c.path)).join(", ")}.`,
           ...(has("both_changed") || has("local_deleted")
-            ? [`Rosebud's copies are in ${options.remoteCopies}.`]
+            ? [`Rosebud's copies are in ${quoted(options.remoteCopies)}.`]
             : []),
           ...(has("both_changed")
             ? ["Merge each into your file, keeping both changes."]
@@ -205,7 +226,7 @@ function pullAdvice(options: {
                 "A file Rosebud deleted has no copy: keep it to restore it, or delete it.",
               ]
             : []),
-          `Then run rosebud update ${flags} --expected-version ${version}. rosebud pull ${flags} --force takes Rosebud's version of these files instead.`,
+          `Then run \`rosebud update ${flags} --expected-version ${version}\`. \`rosebud pull ${flags} --force\` takes Rosebud's version of these files instead.`,
         ];
   return [...steps, ...notes].join(" ");
 }
@@ -224,6 +245,12 @@ function malformedManifest(handle: ProjectHandle): boolean {
 }
 /** Ids that help recover from an error, added to its JSON. */
 const errorContext: { job_id?: string; asset_id?: string } = {};
+/** What was asked, so an error's next step can name this game's folder and state file. */
+const invocation: {
+  command: string;
+  directory: string | undefined;
+  state: string | undefined;
+} = { command: "", directory: undefined, state: undefined };
 
 async function main(): Promise<void> {
   let args: ReturnType<typeof parseArgs>;
@@ -266,6 +293,9 @@ async function main(): Promise<void> {
     return;
   }
   const command = positionals[0] ?? "";
+  invocation.command = command;
+  invocation.directory = value("directory");
+  invocation.state = value("state");
   const client = value("agent-client") ?? "unknown";
   if (
     ![
@@ -410,7 +440,7 @@ async function main(): Promise<void> {
         output({
           ...shown,
           state_file: statePath,
-          next_action: `This game is in ${result.owner}'s Rosebud account; nothing to claim. Ship new builds to the same link with rosebud update and this state file.`,
+          next_action: `This game is in ${result.owner}'s Rosebud account; nothing to claim. Ship new builds to the same link with \`rosebud update\` and this state file.`,
         });
         return;
       }
@@ -423,7 +453,7 @@ async function main(): Promise<void> {
       output({
         ...result,
         state_file: statePath,
-        next_action: `Claim by ${result.claim_expires_at} to keep this game online for free. Unclaimed uploads are permanently deleted after one hour. Run rosebud connect with this state file, then give its private approval link to the person.`,
+        next_action: `Claim by ${result.claim_expires_at} to keep this game online for free. Unclaimed uploads are permanently deleted after one hour. Run \`rosebud connect\` with this state file, then give its private approval link to the person.`,
       });
       return;
     }
@@ -672,9 +702,12 @@ async function main(): Promise<void> {
       await saveState(path, credentials);
       output(result);
     } catch (error) {
+      // A busy refusal is a rejection too, but its rerun must send the very same
+      // operation, so the saved one stays.
       if (
         error instanceof RosebudError &&
         error.outcome !== "unknown" &&
+        error.code !== "busy" &&
         !resuming
       ) {
         delete credentials.pending;
@@ -761,7 +794,7 @@ async function account(
             ...loginView(current, saved),
             next_action:
               current.status === "active"
-                ? "Already logged in. To use another account, run rosebud logout, then rosebud login."
+                ? "Already logged in. To use another account, run `rosebud logout`, then `rosebud login`."
                 : "This login still waits for approval. Give the person its private approval_url.",
           });
           return;
@@ -784,7 +817,7 @@ async function account(
         approval_url: login.approval_url,
         expires_at: login.expires_at,
         next_action:
-          "Give the private approval_url to the person. After they sign in and approve, run rosebud whoami, then make assets.",
+          "Give the private approval_url to the person. After they sign in and approve, run `rosebud whoami`, then make assets.",
       });
       return;
     }
@@ -1112,11 +1145,15 @@ async function createAsset(
         });
       } catch (error) {
         // A rejection proves no job holds this key, unless a retry was refused
-        // (auth, throttling) before Rosebud looked the key up.
+        // (auth, throttling, busy) before Rosebud looked the key up.
         if (
           error instanceof RosebudError &&
           error.outcome !== "unknown" &&
-          !(resuming && [401, 403, 429].includes(error.status ?? 0))
+          !(
+            resuming &&
+            ([401, 403, 429].includes(error.status ?? 0) ||
+              error.code === "busy")
+          )
         )
           await removeState(path);
         throw error;
@@ -1131,7 +1168,7 @@ async function createAsset(
       await removeState(path);
       output({
         ...job,
-        next_action: `Run rosebud assets status ${job.id} until it succeeds, then rosebud assets download <asset id> --out <file>.`,
+        next_action: `Run \`rosebud assets status ${job.id}\` until it succeeds, then \`rosebud assets download <asset id> --out <file>\`.`,
       });
       return;
     }
@@ -1195,12 +1232,13 @@ async function createAsset(
   });
 }
 
-/** Server-validated diagnostics worth showing; never the raw response body. */
-function apiDetails(error: RosebudError): {
+interface ApiDetails {
   filename?: string;
   limit?: number;
   changed_paths?: string[] | null;
-} {
+}
+/** Server-validated diagnostics worth showing; never the raw response body. */
+function apiDetails(error: RosebudError): ApiDetails {
   const body = error.body;
   if (
     error.kind !== "api" ||
@@ -1214,15 +1252,22 @@ function apiDetails(error: RosebudError): {
     return {};
   const { filename, limit, changed_paths: changed } = details;
   const paths = pathList(changed);
+  const bytes = byteLimit(limit);
   return {
     ...(typeof filename === "string" && filename.length <= 512
       ? { filename }
       : {}),
-    ...(typeof limit === "number" && Number.isSafeInteger(limit)
-      ? { limit }
-      : {}),
+    ...(bytes !== undefined ? { limit: bytes } : {}),
     ...(paths !== undefined ? { changed_paths: paths } : {}),
   };
+}
+/** A limit as a number: servers before ENG-4832 sent it as a string of digits. */
+function byteLimit(value: JsonValue | undefined): number | undefined {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) ? value : undefined;
+  return typeof value === "string" && /^\d{1,15}$/.test(value)
+    ? Number(value)
+    : undefined;
 }
 /** The files an update conflict names: null when Rosebud can't tell, else a bounded list. */
 function pathList(value: JsonValue | undefined): string[] | null | undefined {
@@ -1234,6 +1279,54 @@ function pathList(value: JsonValue | undefined): string[] | null | undefined {
     : undefined;
 }
 
+/**
+ * What to do about a refusal, in words an agent can act on. Commands sit in
+ * backticks so a sentence's period never sticks to them. Never about pricing.
+ */
+function nextAction(
+  error: RosebudError,
+  details: ApiDetails,
+): string | undefined {
+  const { command, directory, state } = invocation;
+  switch (error.code) {
+    case "busy": {
+      const seconds = error.retryAfterSeconds;
+      const wait =
+        seconds === undefined
+          ? "a few seconds"
+          : `${seconds} second${seconds === 1 ? "" : "s"}`;
+      return command === "publish"
+        ? `Rosebud is busy. Run the same command again in ${wait}; no game was created, so publishing again is safe.`
+        : `Rosebud is busy. Run the same command again in ${wait}; nothing was changed.`;
+    }
+    case "upload_retry":
+      return "Run the same command again; Rosebud is still checking this game's existing files.";
+    case "version_conflict": {
+      const changed = details.changed_paths;
+      const pull = `\`rosebud pull ${gameFlags(directory, state)}\``;
+      if (changed === null)
+        return `Rosebud can't tell which files changed. Run ${pull} and compare before updating.`;
+      if (changed && changed.length === 0)
+        return `Only the game's title, description or cover changed in Rosebud. Run \`rosebud status${state === undefined ? "" : ` --state ${shellArg(state)}`}\` and pass its content_version as \`--expected-version\`.`;
+      if (changed)
+        return `Rosebud changed ${changed.length} file(s) since your last sync: ${changed.slice(0, 10).map(quoted).join(", ")}${changed.length > 10 ? ", …" : ""}. Run ${pull} to bring them in, merge, then update again.`;
+      return undefined;
+    }
+    case "plan_required":
+      return "Publishing and updating still work. Reading files back needs the game owner's plan to include code download, so ask the person what they changed in Rosebud before you update, to avoid replacing their edits.";
+    case "release_upload_limit":
+      return `This update adds more new media than Rosebud takes at once${details.limit === undefined ? "" : ` (limit: ${details.limit} bytes)`}. Update with part of the new media first, then again with the rest; files Rosebud already has are not uploaded again.`;
+    case "upload_stale":
+    case "upload_expired":
+    case "invalid_upload":
+      return "Run the same command again; it declares the media in a new upload session.";
+    case "sync_unavailable":
+      return "This Rosebud server can't read files back or take file-by-file uploads yet.";
+    default:
+      return undefined;
+  }
+}
+
 main().catch((error: unknown) => {
   const known =
     error instanceof RosebudError
@@ -1242,8 +1335,10 @@ main().catch((error: unknown) => {
           "Could not complete the command. Check local state before retrying; no automatic retry was attempted.",
           { kind: "response", code: "unexpected_error", outcome: "unknown" },
         );
+  const details = apiDetails(known);
+  const action = known.kind === "api" ? nextAction(known, details) : undefined;
   process.stderr.write(
-    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...apiDetails(known), ...errorContext } })}\n`,
+    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...details, ...(action ? { next_action: action } : {}), ...errorContext } })}\n`,
   );
   process.exitCode =
     known.outcome === "unknown"

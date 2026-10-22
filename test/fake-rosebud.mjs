@@ -44,6 +44,11 @@ export async function fakeRosebud(t, options = {}) {
     hideMd5: options.hideMd5 ?? false, // files() reports no MD5, as for old uploads
     failMedia: options.failMedia ?? 0, // media downloads answered 503, one each
     damageMedia: options.damageMedia ?? false, // media downloads lose their last byte
+    uploadRetries: options.uploadRetries ?? 0, // upload sessions answered 409 upload_retry, one each
+    uploadRetryAfter: options.uploadRetryAfter, // their Retry-After seconds, when given
+    // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
+    // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
+    inject: [],
   };
   const manifest = () =>
     new Map([
@@ -109,6 +114,23 @@ export async function fakeRosebud(t, options = {}) {
     });
     const route = url.pathname;
     try {
+      const canned = game.inject.find(
+        (item) => route.endsWith(item.path) && (item.times ?? 1) > 0,
+      );
+      if (canned) {
+        canned.times = (canned.times ?? 1) - 1;
+        res
+          .writeHead(canned.status, {
+            "Content-Type": "application/json",
+            ...canned.headers,
+          })
+          .end(
+            JSON.stringify({
+              error: { message: `fake: ${canned.error.code}`, ...canned.error },
+            }),
+          );
+        return;
+      }
       // Media downloads carry no credential, like signed storage URLs.
       if (route.startsWith("/media/")) {
         const data = game.media.get(
@@ -123,6 +145,24 @@ export async function fakeRosebud(t, options = {}) {
       }
       if (route === "/api/developer/uploads/" && req.method === "POST") {
         if (!game.sync) return fail(res, 503, "sync_unavailable");
+        if (game.uploadRetries > 0) {
+          game.uploadRetries -= 1;
+          return res
+            .writeHead(409, {
+              "Content-Type": "application/json",
+              ...(game.uploadRetryAfter === undefined
+                ? {}
+                : { "Retry-After": String(game.uploadRetryAfter) }),
+            })
+            .end(
+              JSON.stringify({
+                error: {
+                  code: "upload_retry",
+                  message: "Still checking this game's files.",
+                },
+              }),
+            );
+        }
         const body = JSON.parse(bytes);
         if (body.project_id && req.headers.authorization !== `Bearer ${AGENT}`)
           return fail(res, 401, "invalid_connection");

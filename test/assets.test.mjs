@@ -60,6 +60,7 @@ async function rosebud(t) {
     downloads: [],
     loseJobResponse: false,
     throttle: [],
+    busy: 0,
     publishes: [],
     statusChecks: [],
   };
@@ -209,6 +210,11 @@ async function rosebud(t) {
     }
     if (path === "/api/v1/asset-jobs/") {
       api.jobPosts.push(body);
+      if (api.busy > 0) {
+        api.busy--;
+        json(res, { error: { code: "busy", message: "Try again." } }, 503);
+        return;
+      }
       const existing = [...api.jobs].find(
         ([, row]) => row.key === body.idempotency_key,
       );
@@ -314,6 +320,10 @@ test("login waits for the person's approval, whoami reports it and logout forget
   assert.equal(login.code, 0, login.stderr);
   assert.equal(login.data.status, "pending");
   assert.equal(login.data.approval_url, approval);
+  assert.match(
+    login.data.next_action,
+    /run `rosebud whoami`, then make assets\./,
+  );
   assert.ok(!login.stdout.includes(token));
   assert.deepEqual(api.logins, [
     { client: "codex", name: "Moon Garden agent" },
@@ -340,7 +350,10 @@ test("login waits for the person's approval, whoami reports it and logout forget
   // Logging in again reports the active login instead of replacing it.
   const again = await cli(root, api, ["login"]);
   assert.equal(again.data.status, "active");
-  assert.match(again.data.next_action, /logout/);
+  assert.match(
+    again.data.next_action,
+    /run `rosebud logout`, then `rosebud login`\./,
+  );
   assert.equal(api.logins.length, 1);
 
   const logout = await cli(root, api, ["logout"]);
@@ -425,6 +438,32 @@ test("assets quote and create map inputs, respect --max-credits and save the fin
   assert.equal(api.quotes.length, 3);
 });
 
+test("a busy refusal of a resumed create keeps its saved request, so the rerun still cannot pay twice", async (t) => {
+  const { root, api } = await loggedIn(t);
+  const request = [
+    "assets",
+    "create",
+    "--model",
+    "flux-2-flash",
+    "--prompt",
+    "Mossy stone tile",
+  ];
+  api.loseJobResponse = true;
+  assert.equal((await cli(root, api, request)).code, 4);
+  // Busy refused the retry before Rosebud looked the key up: a job may still hold it.
+  api.busy = 1;
+  const busy = await cli(root, api, request);
+  assert.equal(busy.code, 3, busy.stderr);
+  assert.equal(busy.error.code, "busy");
+  assert.equal(busy.error.outcome, "rejected");
+  const recovered = await cli(root, api, request);
+  assert.equal(recovered.code, 0, recovered.stderr);
+  assert.equal(recovered.data.resumed, true);
+  assert.equal(api.jobs.size, 1);
+  assert.equal(api.quotes.length, 1);
+  assert.deepEqual(api.jobPosts[2], api.jobPosts[0]);
+});
+
 test("rerunning a create after a lost response resumes the same job without paying twice", async (t) => {
   const { root, api } = await loggedIn(t);
   const request = [
@@ -454,6 +493,12 @@ test("rerunning a create after a lost response resumes the same job without payi
   const next = await cli(root, api, [...request, "--no-wait"]);
   assert.equal(next.code, 0, next.stderr);
   assert.notEqual(next.data.id, recovered.data.id);
+  assert.match(
+    next.data.next_action,
+    new RegExp(
+      `^Run \`rosebud assets status ${next.data.id}\` until it succeeds, then \`rosebud assets download <asset id> --out <file>\`\\.$`,
+    ),
+  );
   assert.equal(api.jobs.size, 2);
   assert.notEqual(
     api.jobPosts[2].idempotency_key,
@@ -492,6 +537,7 @@ test("a logged-in publish lands in the person's account, ready for update", asyn
   assert.equal(published.data.claimed, true);
   assert.equal(published.data.owner, "Mei");
   assert.match(published.data.next_action, /nothing to claim/);
+  assert.match(published.data.next_action, /with `rosebud update` and/);
   assert.ok(!("claim_url" in published.data));
   assert.ok(!published.stdout.includes(agentToken));
   const handle = JSON.parse(
