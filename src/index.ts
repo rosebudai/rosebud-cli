@@ -666,6 +666,9 @@ export class Rosebud {
         ? { project_id: options.projectId.toLowerCase() }
         : {}),
     });
+    // Each upload carries a signed URL and its headers, about a kilobyte, so the
+    // answer may grow past the usual 1 MiB with the files declared, and no further.
+    const responseLimit = 1024 * 1024 + options.files.length * 8 * 1024;
     let body: Record<string, JsonValue>;
     let remaining: number | undefined;
     let stalls = 0;
@@ -677,6 +680,7 @@ export class Rosebud {
           request,
           options.token,
           options.signal,
+          responseLimit,
         );
         break;
       } catch (error) {

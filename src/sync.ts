@@ -642,6 +642,35 @@ export async function pullInto(options: {
     // for a file deleted here.
     const staged = new Map<string, string>();
     for (const path of plan.write) staged.set(path, await stage(path));
+    // The folder was read before the downloads. A file edited or created here
+    // meanwhile is the agent's own: stop before changing anything, and a rerun
+    // compares it like any other edit.
+    const byKey = new Map([...local.keys()].map((path) => [fold(path), path]));
+    // A folder that was already here is path_conflict's to refuse, below.
+    const walked = new Set(folders.map(fold));
+    const checked = new Set<string>();
+    for (const path of [
+      ...plan.remove,
+      ...plan.write.map((path) => plan.localNames.get(path) ?? path),
+    ]) {
+      const was = local.has(path) ? path : byKey.get(fold(path));
+      if (was !== undefined && checked.has(was)) continue;
+      const absolute = join(directory, ...(was ?? path).split("/"));
+      const changed =
+        was === undefined
+          ? !walked.has(fold(path)) &&
+            (await lstat(absolute).then(
+              () => true,
+              () => false,
+            ))
+          : (await md5File(absolute).catch(() => undefined)) !== local.get(was);
+      if (changed)
+        throw inputError(
+          "folder_changed",
+          `${was ?? path} changed while pull was downloading, so pull left the folder as it was. Run rosebud pull again.`,
+        );
+      if (was !== undefined) checked.add(was);
+    }
     // Removals first: on a case-insensitive disk a file Rosebud renamed by case
     // is both removed and written, and the write must come last.
     for (const path of plan.remove)

@@ -233,19 +233,23 @@ async function packDirectory(
   let total = 0;
   let hasIndex = false;
   // Pull leaves a local name that differs from Rosebud's only in Unicode form as it
-  // is, so a name matches in either form; its exact spelling comes first.
-  const byForm = new Map<string, "media" | "text">();
+  // is, so a name matches in either form, its exact spelling first, and goes up
+  // under the name Rosebud holds.
+  type Held = { type: "media" | "text"; name: string };
+  const byForm = new Map<string, Held>();
   for (const [paths, type] of [
     [knownText, "text"],
     [knownMedia, "media"],
   ] as const)
-    for (const path of paths) byForm.set(path.normalize("NFC"), type);
-  const heldAs = (path: string): "media" | "text" | undefined =>
+    for (const name of paths) byForm.set(name.normalize("NFC"), { type, name });
+  const heldAs = (path: string): Held | undefined =>
     knownMedia.has(path)
-      ? "media"
+      ? { type: "media", name: path }
       : knownText.has(path)
-        ? "text"
+        ? { type: "text", name: path }
         : byForm.get(path.normalize("NFC"));
+  /** Each name sent, in NFC, as Rosebud compares names → the local path it came from. */
+  const sentFrom = new Map<string, string>();
   const entryAdded = () => {
     entries += 1;
     if (entries > MAX_ENTRIES)
@@ -311,13 +315,23 @@ async function packDirectory(
       // What Rosebud already holds keeps its type, media first; the rest goes by extension.
       const held = heldAs(path);
       const isMedia =
-        held === "media" ||
+        held?.type === "media" ||
         (held === undefined &&
           MEDIA_EXTENSIONS.has(extension) &&
           (path.startsWith("assets/") || !TEXT_OUTSIDE_ASSETS.has(extension)));
+      // New media goes up in NFC, the only form Rosebud names media in; the bytes
+      // are always read from the file as the folder names it.
+      const sent = held?.name ?? (isMedia ? path.normalize("NFC") : path);
+      const twin = sentFrom.get(sent.normalize("NFC"));
+      if (twin !== undefined)
+        throw inputError(
+          "duplicate_path",
+          `Keep one of ${twin} and ${path}: Rosebud compares names in Unicode NFC, where they are the same name.`,
+        );
+      sentFrom.set(sent.normalize("NFC"), path);
       if (isMedia) {
-        if (held !== "media") validateMediaPath(path, extension);
-        mediaPaths.push(path);
+        if (held?.type !== "media") validateMediaPath(sent, extension);
+        mediaPaths.push(sent);
       }
       // Text too, so an oversized file is refused before it is read.
       if (split && stat.size > FILE_BYTES)
@@ -333,8 +347,8 @@ async function packDirectory(
             `Remove the empty file ${path}; Rosebud doesn't store empty media.`,
           );
         counted(size);
-        media.push({ path, absolute, size, md5 });
-        files[path] = md5;
+        media.push({ path: sent, absolute, size, md5 });
+        files[sent] = md5;
         continue;
       }
       entryAdded();
@@ -342,9 +356,9 @@ async function packDirectory(
       zippedBytes += content.byteLength;
       counted(content.byteLength);
       if (!isMedia) checkText(content, path);
-      zipped[path] = content;
-      files[path] = md5Of(content);
-      hasIndex ||= path === "index.html";
+      zipped[sent] = content;
+      files[sent] = md5Of(content);
+      hasIndex ||= sent === "index.html";
     }
   }
   await walk("");

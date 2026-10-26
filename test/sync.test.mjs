@@ -18,7 +18,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { strToU8, zipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 import { Rosebud, RosebudError, prepareRelease } from "../dist/index.js";
 import { diskNames, planPull, safePath } from "../dist/sync.js";
 import { fakeRosebud, md5, AGENT, PROJECT } from "./fake-rosebud.mjs";
@@ -138,6 +138,40 @@ test("an upload session response that names undeclared paths is unexpected", asy
       files: [{ path: "assets/a.png", size: 8, md5: md5(png) }],
     }),
     (e) => e.code === "unexpected_response",
+  );
+});
+
+test("an upload session for many files may answer with more than 1 MiB of signed URLs", async (t) => {
+  const files = Array.from({ length: 1200 }, (_, index) => ({
+    path: `assets/a${index}.png`,
+    size: 8,
+    md5: md5(png),
+  }));
+  // A storage signed URL runs to about a kilobyte, mostly its signature.
+  const signature = `X-Goog-Signature=${"a".repeat(1000)}`;
+  const api = await rogueServer(t, (_req, res) =>
+    res.writeHead(201, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        upload_id: randomUUID(),
+        upload_token: "U".repeat(43),
+        expires_at: "x",
+        linked: [],
+        uploads: files.map(({ path }) => ({
+          path,
+          method: "PUT",
+          url: `https://storage.example/${path}?${signature}`,
+          headers: { "Content-Type": "image/png" },
+        })),
+      }),
+    ),
+  );
+  const client = new Rosebud({ apiBaseUrl: api.base });
+  const session = await client.createUploadSession({ files });
+  assert.equal(session.uploads.length, 1200);
+  // The allowance grows with the files declared, not without bound.
+  await assert.rejects(
+    client.createUploadSession({ files: files.slice(0, 1) }),
+    (e) => e.code === "unexpected_response" && /exceeded/.test(e.message),
   );
 });
 
@@ -1917,6 +1951,45 @@ test("a failed download during a rename by case leaves the old name, and a rerun
   assert.deepEqual(await readFile(join(root, "dist/assets/hero.png")), png);
 });
 
+test("a file edited or created here while pull downloads is never overwritten: pull stops before changing the folder", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  game.edit({
+    text: { "index.html": "two", "AGENTS.md": "notes" },
+    media: { "assets/new.png": png },
+  });
+  const before = await handle(root);
+  for (const [path, content] of [
+    ["index.html", "MY EDIT"],
+    ["AGENTS.md", "MY NOTES"],
+  ]) {
+    game.beforeMedia = () => writeFile(join(root, "dist", path), content);
+    const pull = await run(root, ["pull", "--directory", "dist"]);
+    assert.equal(pull.error?.code, "folder_changed", path);
+    assert.match(pull.error.message, new RegExp(path));
+    assert.equal(await readFile(join(root, "dist", path), "utf8"), content);
+    assert.ok(!(await readdir(join(root, "dist"))).includes("assets"));
+    assert.deepEqual(await handle(root), before);
+  }
+  // A rerun sees both edits and keeps them.
+  game.beforeMedia = undefined;
+  const rerun = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.deepEqual(
+    rerun.data.conflicts.map((c) => c.path),
+    ["AGENTS.md", "index.html"],
+  );
+  assert.deepEqual(rerun.data.written, ["assets/new.png"]);
+  assert.equal(
+    await readFile(join(root, "dist/index.html"), "utf8"),
+    "MY EDIT",
+  );
+  assert.equal(
+    await readFile(join(root, "dist/AGENTS.md"), "utf8"),
+    "MY NOTES",
+  );
+});
+
 test("a download that fails its MD5 is refused and never replaces the file or moves the handle", async (t) => {
   const game = await fakeRosebud(t, { damageMedia: true });
   const root = await connected(t, game, {
@@ -3158,6 +3231,74 @@ test("an unchanged editor SVG that the folder spells in another Unicode form sta
   assert.equal(game.text.get(nfc), "<svg/>");
   assert.deepEqual([...game.media.keys()], []);
   assert.deepEqual(game.puts, []);
+});
+
+test("a file Rosebud holds goes up under Rosebud's spelling, and new media in NFC, read from the local name", async (t) => {
+  const root = await folder(t, {
+    "index.html": "x",
+    "assets/cafe\u0301.png": png,
+    "assets/the\u0301.png": Buffer.concat([png, png]),
+    "notes/cafe\u0301.md": "notes",
+  });
+  const release = await prepareRelease(
+    { directory: root },
+    {
+      splitMedia: true,
+      knownMedia: new Set(["assets/caf\u00e9.png"]),
+      knownText: new Set(["notes/caf\u00e9.md"]),
+    },
+  );
+  assert.deepEqual(
+    release.media.map((m) => m.path),
+    ["assets/caf\u00e9.png", "assets/th\u00e9.png"],
+  );
+  assert.deepEqual(release.mediaPaths, [
+    "assets/caf\u00e9.png",
+    "assets/th\u00e9.png",
+  ]);
+  // The bytes come from the file as the folder names it.
+  assert.deepEqual(await readFile(release.media[0].absolute), png);
+  assert.ok(Object.keys(unzipSync(release.zip)).includes("notes/caf\u00e9.md"));
+  assert.deepEqual(Object.keys(release.files).sort(), [
+    "assets/caf\u00e9.png",
+    "assets/th\u00e9.png",
+    "index.html",
+    "notes/caf\u00e9.md",
+  ]);
+});
+
+test("two local names that are one name in Unicode NFC are refused as duplicate_path", async (t) => {
+  if (await formInsensitiveDisk(t))
+    return t.skip("this file system stores both forms as one file");
+  const root = await folder(t, {
+    "index.html": "x",
+    "caf\u00e9.js": "1",
+    "cafe\u0301.js": "2",
+  });
+  await assert.rejects(
+    prepareRelease({ directory: root }, { splitMedia: true }),
+    (e) => e.code === "duplicate_path",
+  );
+});
+
+test("an unchanged media file that the folder spells in another Unicode form is linked on update", async (t) => {
+  if (!(await formInsensitiveDisk(t)))
+    return t.skip("this file system keeps Unicode forms apart");
+  const nfd = "assets/cafe\u0301.png",
+    nfc = "assets/caf\u00e9.png";
+  const game = await fakeRosebud(t, { nfc: true });
+  const root = await connected(t, game, { "index.html": "x" });
+  game.edit({ media: { [nfc]: png } });
+  await mkdir(join(root, "dist/assets"));
+  await writeFile(join(root, "dist", nfd), png);
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "synced");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual([...game.media.keys()], [nfc]);
+  assert.deepEqual(game.puts, []);
+  assert.deepEqual((await handle(root)).media, [nfc]);
 });
 
 test("conflict advice fits the conflicts, and skipped files are mentioned there too", async (t) => {

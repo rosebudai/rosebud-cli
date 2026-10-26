@@ -51,6 +51,8 @@ export async function fakeRosebud(t, options = {}) {
     uploadRemaining: [...(options.uploadRemaining ?? [])],
     // Text names are stored in NFC, as Rosebud's file rules say, whatever form was uploaded.
     nfc: options.nfc ?? false,
+    // Awaited with the media path before each media download is answered, as a test's hook.
+    beforeMedia: undefined,
     putHeaders: options.putHeaders ?? {}, // more headers each signed upload must carry
     // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
     // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
@@ -147,9 +149,9 @@ export async function fakeRosebud(t, options = {}) {
       }
       // Media downloads carry no credential, like signed storage URLs.
       if (route.startsWith("/media/")) {
-        const data = game.media.get(
-          decodeURIComponent(route.slice("/media/".length)),
-        );
+        const path = decodeURIComponent(route.slice("/media/".length));
+        await game.beforeMedia?.(path);
+        const data = game.media.get(path);
         if (data && game.failMedia > 0) {
           game.failMedia -= 1;
           return res.writeHead(503).end();
@@ -183,6 +185,14 @@ export async function fakeRosebud(t, options = {}) {
         const body = JSON.parse(bytes);
         if (body.project_id && req.headers.authorization !== `Bearer ${AGENT}`)
           return fail(res, 401, "invalid_connection");
+        // Rosebud names media in NFC; another form is not its canonical path.
+        const decomposed = body.files.find(
+          (file) => game.nfc && file.path !== file.path.normalize("NFC"),
+        );
+        if (decomposed)
+          return fail(res, 400, "noncanonical_path", {
+            filename: decomposed.path,
+          });
         const id = randomUUID(),
           token = "U".repeat(43);
         const entries = new Map(),
