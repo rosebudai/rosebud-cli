@@ -232,6 +232,20 @@ async function packDirectory(
   let zippedBytes = 0;
   let total = 0;
   let hasIndex = false;
+  // Pull leaves a local name that differs from Rosebud's only in Unicode form as it
+  // is, so a name matches in either form; its exact spelling comes first.
+  const byForm = new Map<string, "media" | "text">();
+  for (const [paths, type] of [
+    [knownText, "text"],
+    [knownMedia, "media"],
+  ] as const)
+    for (const path of paths) byForm.set(path.normalize("NFC"), type);
+  const heldAs = (path: string): "media" | "text" | undefined =>
+    knownMedia.has(path)
+      ? "media"
+      : knownText.has(path)
+        ? "text"
+        : byForm.get(path.normalize("NFC"));
   const entryAdded = () => {
     entries += 1;
     if (entries > MAX_ENTRIES)
@@ -295,14 +309,14 @@ async function packDirectory(
         );
       const extension = extname(name);
       // What Rosebud already holds keeps its type, media first; the rest goes by extension.
-      const heldAsMedia = knownMedia.has(path);
+      const held = heldAs(path);
       const isMedia =
-        heldAsMedia ||
-        (!knownText.has(path) &&
+        held === "media" ||
+        (held === undefined &&
           MEDIA_EXTENSIONS.has(extension) &&
           (path.startsWith("assets/") || !TEXT_OUTSIDE_ASSETS.has(extension)));
       if (isMedia) {
-        if (!heldAsMedia) validateMediaPath(path, extension);
+        if (held !== "media") validateMediaPath(path, extension);
         mediaPaths.push(path);
       }
       // Text too, so an oversized file is refused before it is read.

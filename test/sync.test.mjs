@@ -1775,6 +1775,70 @@ test("pull keeps Rosebud's copies out of the folder", async (t) => {
   assert.deepEqual(await readdir(join(root, ".rosebud")), ["project.json"]);
 });
 
+test("pull refuses a folder that is the copies' folder through a linked parent, and deletes nothing", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(
+    t,
+    game,
+    { "index.html": "one", "game.js": "1" },
+    { directory: "real/project.remote", state: "real/project.json" },
+  );
+  // A junction on Windows needs no privileges and resolves like a link.
+  await symlink(
+    join(root, "real"),
+    join(root, "alias"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  game.edit({ text: { "index.html": "two" } });
+  const before = await readFile(join(root, "real/project.json"), "utf8");
+  for (const directory of ["alias/project.remote", "alias/project.remote/x"]) {
+    const refused = await run(root, [
+      "pull",
+      "--directory",
+      directory,
+      "--state",
+      "real/project.json",
+    ]);
+    assert.equal(refused.error?.code, "state_in_build", directory);
+  }
+  assert.deepEqual((await readdir(join(root, "real/project.remote"))).sort(), [
+    "game.js",
+    "index.html",
+  ]);
+  assert.equal(
+    await readFile(join(root, "real/project.remote/index.html"), "utf8"),
+    "one",
+  );
+  assert.deepEqual(
+    await readFile(join(root, "real/project.json"), "utf8"),
+    before,
+  );
+});
+
+test("a state file inside the folder through a linked parent is refused before anything is written", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await folder(t, { "dist/index.html": "one" });
+  await symlink(
+    join(root, "dist"),
+    join(root, "alias"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  for (const command of ["publish", "pull"]) {
+    const refused = await run(root, [
+      command,
+      "--directory",
+      "dist",
+      "--state",
+      "alias/project.json",
+      "--api-base",
+      game.base,
+    ]);
+    assert.equal(refused.error?.code, "state_in_build", command);
+  }
+  assert.deepEqual(await readdir(join(root, "dist")), ["index.html"]);
+  assert.equal(game.releases, 0);
+});
+
 test("pull needs --directory, refuses --zip and wants an approved connection", async (t) => {
   const game = await fakeRosebud(t);
   const root = await connected(t, game, { "index.html": "one" });
@@ -1828,6 +1892,29 @@ test("a pull that fails part-way leaves the handle unchanged, and a rerun finish
   assert.equal((await readFile(join(root, "dist/assets/new.png"))).length, 16);
   assert.equal((await handle(root)).content_version, game.version);
   assert.deepEqual(await readdir(join(root, ".rosebud")), ["project.json"]);
+});
+
+test("a failed download during a rename by case leaves the old name, and a rerun finishes the rename", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  // The editor keeps a media name's letter case, which a new upload can't have.
+  game.edit({ media: { "assets/Hero.png": png } });
+  const first = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(first.code, 0, JSON.stringify(first.error));
+  game.edit({ remove: ["assets/Hero.png"], media: { "assets/hero.png": png } });
+  const before = await handle(root);
+  game.failMedia = 1;
+  const failed = await run(root, ["pull", "--directory", "dist"]);
+  assert.notEqual(failed.code, 0);
+  assert.deepEqual(await readdir(join(root, "dist/assets")), ["Hero.png"]);
+  assert.deepEqual(await readFile(join(root, "dist/assets/Hero.png")), png);
+  assert.deepEqual(await handle(root), before);
+  const rerun = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(rerun.data.status, "synced");
+  assert.deepEqual(rerun.data.conflicts, []);
+  assert.deepEqual(await readdir(join(root, "dist/assets")), ["hero.png"]);
+  assert.deepEqual(await readFile(join(root, "dist/assets/hero.png")), png);
 });
 
 test("a download that fails its MD5 is refused and never replaces the file or moves the handle", async (t) => {
@@ -3029,6 +3116,48 @@ test("a local edit to a file Rosebud names in another Unicode form is never over
     "index.html",
   ]);
   assert.equal(await readFile(join(root, "dist", nfd), "utf8"), "rosie's");
+});
+
+test("a path Rosebud holds keeps its type when the folder spells it in another Unicode form", async (t) => {
+  const root = await folder(t, {
+    "index.html": "x",
+    "assets/cafe\u0301.svg": "<svg/>",
+    "levels/cafe\u0301.json": "{}",
+  });
+  const release = await prepareRelease(
+    { directory: root },
+    {
+      splitMedia: true,
+      knownText: new Set(["assets/caf\u00e9.svg"]),
+      knownMedia: new Set(["levels/caf\u00e9.json"]),
+    },
+  );
+  const nfc = (paths) => paths.map((path) => path.normalize("NFC"));
+  assert.deepEqual(nfc(release.mediaPaths), ["levels/caf\u00e9.json"]);
+  assert.deepEqual(nfc(release.media.map((m) => m.path)), [
+    "levels/caf\u00e9.json",
+  ]);
+});
+
+test("an unchanged editor SVG that the folder spells in another Unicode form stays text on update", async (t) => {
+  if (!(await formInsensitiveDisk(t)))
+    return t.skip("this file system keeps Unicode forms apart");
+  const nfd = "assets/cafe\u0301.svg",
+    nfc = "assets/caf\u00e9.svg";
+  const game = await fakeRosebud(t, { nfc: true });
+  const root = await connected(t, game, { "index.html": "x" });
+  // Rosie wrote it as text; the folder holds the same file under another form.
+  game.edit({ text: { [nfc]: "<svg/>" } });
+  await mkdir(join(root, "dist/assets"));
+  await writeFile(join(root, "dist", nfd), "<svg/>");
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "synced");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(game.text.get(nfc), "<svg/>");
+  assert.deepEqual([...game.media.keys()], []);
+  assert.deepEqual(game.puts, []);
 });
 
 test("conflict advice fits the conflicts, and skipped files are mentioned there too", async (t) => {

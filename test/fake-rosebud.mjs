@@ -83,11 +83,13 @@ export async function fakeRosebud(t, options = {}) {
     }).formData();
   }
   // Rosebud's rule for a ZIP entry: .svg and .gltf are text outside assets/, and inside it
-  // they stay text on an update when Rosebud already holds them as text.
+  // they stay text on an update when Rosebud already holds them as text, under the name
+  // it compares in NFC.
   const zippedAsMedia = (path) =>
     MEDIA.test(path) &&
     (!/\.(svg|gltf)$/.test(path) ||
-      (path.startsWith("assets/") && !game.text.has(path)));
+      (path.startsWith("assets/") &&
+        !game.text.has(game.nfc ? path.normalize("NFC") : path)));
   // A release is a snapshot: the ZIP's text plus every path the session declared.
   async function snapshot(fields, res) {
     const zip = unzipSync(

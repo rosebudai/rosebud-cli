@@ -30,7 +30,7 @@ import {
   accountPath,
   assetRequestPath,
   credentialPath,
-  outsideBuild,
+  outsideBuildOnDisk,
   prepareCredentials,
   readState,
   releaseLocks,
@@ -453,7 +453,7 @@ async function main(): Promise<void> {
     if (v !== undefined) metadata[key] = v;
   }
   const statePath = resolve(value("state") ?? ".rosebud/project.json");
-  outsideBuild(statePath, directory);
+  await outsideBuildOnDisk(statePath, directory);
 
   await withStateLock(statePath, async () => {
     let handle = await readState<ProjectHandle>(statePath);
@@ -496,7 +496,7 @@ async function main(): Promise<void> {
         api_base_url: api.apiBaseUrl,
         project_id: "new-project",
       });
-      outsideBuild(destination, directory);
+      await outsideBuildOnDisk(destination, directory);
       await prepareCredentials(destination);
       const login = await readAccount(
         accountPath(api.apiBaseUrl),
@@ -528,7 +528,7 @@ async function main(): Promise<void> {
         handle.claim_expires_at = result.claim_expires_at;
       await remember(handle, release, directory);
       const path = credentialPath(statePath, handle);
-      outsideBuild(path, directory);
+      await outsideBuildOnDisk(path, directory);
       await prepareCredentials(path);
       if (publishedToAccount(result)) {
         const { agent_token: agentToken, ...shown } = result;
@@ -582,7 +582,7 @@ async function main(): Promise<void> {
         "This state belongs to another project. Choose a separate --state file.",
       );
     const path = credentialPath(statePath, handle);
-    outsideBuild(path, directory);
+    await outsideBuildOnDisk(path, directory);
     await prepareCredentials(path);
     let credentials = (await readState<Credentials>(path)) ?? {
       api_base_url: api.apiBaseUrl,
@@ -671,7 +671,7 @@ async function main(): Promise<void> {
       );
     if (command === "pull") {
       const remoteCopies = `${statePath.replace(/\.json$/i, "")}.remote`;
-      outsideBuild(remoteCopies, directory);
+      await outsideBuildOnDisk(remoteCopies, directory);
       const folder = resolve(directory ?? "");
       // The last sync describes the folder it happened in, not this one.
       const synced =

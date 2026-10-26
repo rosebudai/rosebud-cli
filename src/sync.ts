@@ -12,9 +12,10 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { join } from "node:path";
 import { isOsJunk } from "./bundle.js";
 import { inputError, RosebudError } from "./errors.js";
+import { withinOnDisk } from "./state.js";
 import type { GameFiles, Rosebud } from "./index.js";
 
 export type ConflictReason =
@@ -525,14 +526,15 @@ export async function pullInto(options: {
   hidden: string[];
 }> {
   const { api, game, directory, remoteCopies } = options;
-  const inside = relative(remoteCopies, directory);
+  // Resolved on disk: through a linked parent, the folder could be the copies'
+  // folder, which is emptied below.
   if (
-    inside === "" ||
-    (inside !== ".." && !inside.startsWith(`..${sep}`) && !isAbsolute(inside))
+    (await withinOnDisk(directory, remoteCopies)) ||
+    (await withinOnDisk(remoteCopies, directory))
   )
     throw inputError(
       "state_in_build",
-      "--directory can't sit inside the folder where pull saves Rosebud's copies (the --state file's name without .json, plus .remote). Choose another folder.",
+      "--directory can't be, hold or sit inside the folder where pull saves Rosebud's copies (the --state file's name without .json, plus .remote). Choose another folder.",
     );
   const skipped: { path: string; reason: SkipReason }[] = [];
   const texts = new Map<string, Uint8Array>();
@@ -593,15 +595,21 @@ export async function pullInto(options: {
       folders,
     });
     await protectCaseRenames(directory, plan, local);
-    const fetchTo = async (path: string, target: string) => {
+    /** Rosebud's copy of a file, checked, beside the downloads, so the folder never holds a half-written file. */
+    const stage = async (path: string) => {
       const text = texts.get(path);
-      let from: string;
-      if (text) {
-        // Staged beside the downloads, so the folder never holds a half-written file.
-        from = join(incoming, randomUUID());
-        await mkdir(incoming, { recursive: true });
-        await writeFile(from, text, { flag: "wx" });
-      } else from = (held.get(path) ?? (await download(path))).to;
+      if (!text) return (held.get(path) ?? (await download(path))).to;
+      const to = join(incoming, randomUUID());
+      await mkdir(incoming, { recursive: true });
+      await writeFile(to, text, { flag: "wx" });
+      return to;
+    };
+    const fetchTo = async (
+      path: string,
+      target: string,
+      from?: string,
+    ): Promise<void> => {
+      from ??= await stage(path);
       try {
         await place(from, target);
       } catch (error) {
@@ -629,6 +637,11 @@ export async function pullInto(options: {
       await fetchTo(path, copy);
       copies[path] = copy;
     }
+    // Every write is staged before the folder changes: a failed download must not
+    // follow a removal, such as a case rename's old name, which a rerun would take
+    // for a file deleted here.
+    const staged = new Map<string, string>();
+    for (const path of plan.write) staged.set(path, await stage(path));
     // Removals first: on a case-insensitive disk a file Rosebud renamed by case
     // is both removed and written, and the write must come last.
     for (const path of plan.remove)
@@ -637,6 +650,7 @@ export async function pullInto(options: {
       await fetchTo(
         path,
         await prepareTarget(directory, plan.localNames.get(path) ?? path),
+        staged.get(path),
       );
     const conflicted = new Set(plan.conflicts.map(({ path }) => fold(path)));
     const files = new Map(

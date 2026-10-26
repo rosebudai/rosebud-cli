@@ -6,13 +6,14 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import nodePath, { dirname, join, resolve } from "node:path";
+import nodePath, { basename, dirname, join, resolve } from "node:path";
 import type { PlatformPath } from "node:path";
 import { inputError } from "./errors.js";
 
@@ -183,24 +184,72 @@ export async function prepareCredentials(path: string): Promise<void> {
     );
   await chmod(dirname(path), 0o700);
 }
+/** Whether `path` is `directory` or inside it. */
+function within(
+  path: string,
+  directory: string,
+  paths: PlatformPath = nodePath,
+): boolean {
+  const child = paths.relative(paths.resolve(directory), paths.resolve(path));
+  return (
+    child === "" ||
+    (child !== ".." &&
+      !child.startsWith(`..${paths.sep}`) &&
+      !paths.isAbsolute(child))
+  );
+}
+const stateInBuild = () =>
+  inputError(
+    "state_in_build",
+    "The upload folder can't contain the CLI's saved state (--state, default .rosebud/project.json) or credentials. Publish the game's build folder, not the project root. No build step? Copy the game's files into a folder such as ./dist and publish that.",
+  );
 /** `paths` defaults to the running platform; tests pass `path.win32` or `path.posix`. */
 export function outsideBuild(
   path: string,
   directory: string | undefined,
   paths: PlatformPath = nodePath,
 ): void {
-  if (directory === undefined) return;
-  const child = paths.relative(paths.resolve(directory), paths.resolve(path));
-  if (
-    child === "" ||
-    (child !== ".." &&
-      !child.startsWith(`..${paths.sep}`) &&
-      !paths.isAbsolute(child))
-  )
-    throw inputError(
-      "state_in_build",
-      "The upload folder can't contain the CLI's saved state (--state, default .rosebud/project.json) or credentials. Publish the game's build folder, not the project root. No build step? Copy the game's files into a folder such as ./dist and publish that.",
-    );
+  if (directory !== undefined && within(path, directory, paths))
+    throw stateInBuild();
+}
+/**
+ * A path as the disk resolves it, for comparing places: links in the part that
+ * exists are resolved and its names take the disk's spelling; the rest is kept
+ * as given. Letter case and Unicode form are folded, so two spellings the disk
+ * might store as one compare equal: refusing them is safe, overlapping is not.
+ */
+async function diskPlace(path: string): Promise<string> {
+  const rest: string[] = [];
+  let current = resolve(path);
+  let found = current;
+  for (;;) {
+    try {
+      found = join(await realpath(current), ...rest);
+      break;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) break;
+      rest.unshift(basename(current));
+      current = parent;
+    }
+  }
+  return found.normalize("NFC").toUpperCase().toLowerCase();
+}
+/** Whether `path` is `directory` or inside it once links are resolved, as the disk sees them. */
+export async function withinOnDisk(
+  path: string,
+  directory: string,
+): Promise<boolean> {
+  return within(await diskPlace(path), await diskPlace(directory));
+}
+/** outsideBuild, also through a linked parent or another spelling of a name. */
+export async function outsideBuildOnDisk(
+  path: string,
+  directory: string | undefined,
+): Promise<void> {
+  outsideBuild(path, directory);
+  if (directory !== undefined && (await withinOnDisk(path, directory)))
+    throw stateInBuild();
 }
 /** Lock files this process holds, each with its text, so a signal that stops it can release them. */
 const heldLocks = new Map<string, string>();
