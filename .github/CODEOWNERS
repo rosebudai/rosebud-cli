@@ -1,3 +1,4 @@
 # Requests the Engineering team, which includes the NanoMAI reviewer bot, on every PR.
 # Branch protection does not require code-owner approval, so this never blocks a merge.
+# NanoMAI posts its review thread in #agent-tasks.
 * @rosebudai/engineering
