@@ -48,7 +48,7 @@ export const isOsJunk = (name: string): boolean =>
 export interface MediaFile {
   /** Relative path inside the game, such as assets/hero.png. */
   path: string;
-  /** The file on disk, read again when it is uploaded. */
+  /** The file on disk, read again when it is uploaded, and sent only if unchanged. */
   absolute: string;
   size: number;
   /** 32 lowercase hex digits. */
@@ -135,6 +135,57 @@ async function digest(
     await file.close();
   }
   return { size, md5: hash.digest("hex") };
+}
+
+/**
+ * A packed media file's bytes, read again to upload: opened without following a
+ * link, and only if they are the bytes that were packed, so a file swapped since
+ * (for a link to a file outside the build, or other bytes of the same size) is
+ * never sent anywhere.
+ */
+export async function readPacked(file: MediaFile): Promise<Uint8Array> {
+  const changed = (what: string) =>
+    inputError(
+      "file_changed",
+      `${file.path} ${what} while uploading. Run the command again once the build has finished.`,
+    );
+  let handle;
+  try {
+    handle = await open(
+      file.absolute,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw changed("could not be read");
+  }
+  try {
+    if (!(await handle.stat()).isFile()) throw changed("changed");
+    // One byte more than was packed shows a file that grew.
+    const bytes = Buffer.alloc(file.size + 1);
+    let read = 0;
+    while (read < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        read,
+        bytes.length - read,
+        read,
+      );
+      if (bytesRead === 0) break;
+      read += bytesRead;
+    }
+    const body = bytes.subarray(0, read);
+    if (
+      read !== file.size ||
+      createHash("md5").update(body).digest("hex") !== file.md5
+    )
+      throw changed("changed");
+    return body;
+  } catch (error) {
+    if (error instanceof RosebudError) throw error;
+    throw changed("could not be read");
+  } finally {
+    await handle.close();
+  }
 }
 
 function validateMediaPath(path: string, extension: string): void {

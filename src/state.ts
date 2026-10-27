@@ -46,6 +46,8 @@ export interface Credentials {
     operation_id: string;
     fingerprint: string;
     expected_version: string;
+    /** The session its media went up in, sent again by an identical rerun. */
+    upload?: { upload_id: string; upload_token: string; expires_at: string };
   };
 }
 /** The account login, one per API origin, kept apart from project credentials. */
@@ -272,6 +274,8 @@ const EMPTY_LOCK_MS = 10_000;
 interface LockRead {
   text: string;
   ageMs: number;
+  /** When it was last written: with its text, which lock file this is. */
+  mtimeMs: number;
   /** The file is there but couldn't be read: its holder is unknown, so it is held. */
   unreadable?: true;
 }
@@ -279,11 +283,12 @@ interface LockRead {
 async function readLock(path: string): Promise<LockRead | undefined> {
   try {
     const text = await readFile(path, "utf8");
-    return { text, ageMs: Date.now() - (await lstat(path)).mtimeMs };
+    const { mtimeMs } = await lstat(path);
+    return { text, ageMs: Date.now() - mtimeMs, mtimeMs };
   } catch (error) {
     return error instanceof Error && "code" in error && error.code === "ENOENT"
       ? undefined
-      : { text: "", ageMs: 0, unreadable: true };
+      : { text: "", ageMs: 0, mtimeMs: 0, unreadable: true };
   }
 }
 const ownerOf = (text: string) => {
@@ -372,38 +377,42 @@ async function releaseLock(path: string): Promise<void> {
   }
 }
 /**
- * Remove the stale lock `path` whose text was `seen`. Of all the commands that
- * found it stale, only the one that creates its claim file may remove it: no
- * other can, so it is still there when that one looks again. A claim left by a
- * takeover that was itself killed is stale and taken over the same way. Returns
- * false when a live command is already taking it over.
+ * Remove the stale lock `path` that was `seen`. Of all the commands that found it
+ * stale, only the one that creates its claim file may remove it, and only while
+ * it is still that file: another takeover may already have replaced it with a
+ * new lock, which on a disk without hard links is empty until it is written. A
+ * claim left by a takeover that was itself killed is stale and taken over the
+ * same way. Returns false when a live command is already taking it over.
  */
 async function takeOver(
   path: string,
-  seen: string,
+  seen: LockRead,
   depth = 0,
 ): Promise<boolean> {
-  const match = LOCK_TEXT.exec(seen);
+  const match = LOCK_TEXT.exec(seen.text);
   const instance = match
     ? (match[2] ?? match[1])
-    : createHash("sha256").update(seen).digest("hex").slice(0, 16);
+    : createHash("sha256").update(seen.text).digest("hex").slice(0, 16);
   const claim = `${path}.${instance}.claim`;
   for (let attempt = 0; attempt < 3 && depth < 8; attempt += 1) {
     if (await createLock(claim))
       try {
         const now = await readLock(path);
         // An unreadable lock is never "the same empty one": its holder is unknown.
-        if (now && !now.unreadable && now.text === seen) await unlink(path);
+        if (
+          now &&
+          now.text === seen.text &&
+          now.mtimeMs === seen.mtimeMs &&
+          stale(path, now)
+        )
+          await unlink(path);
         return true;
       } finally {
         await releaseLock(claim);
       }
     const holder = await readLock(claim);
     if (holder === undefined) continue; // released just now: try again
-    if (
-      !stale(claim, holder) ||
-      !(await takeOver(claim, holder.text, depth + 1))
-    )
+    if (!stale(claim, holder) || !(await takeOver(claim, holder, depth + 1)))
       return false;
   }
   return false;
@@ -431,8 +440,7 @@ async function claimLock(lock: string): Promise<void> {
     const current = await readLock(lock);
     if (current === undefined) continue; // released just now: try again
     if (!stale(lock, current)) throw locked(ownerOf(current.text));
-    if (!(await takeOver(lock, current.text).catch(() => false)))
-      throw locked();
+    if (!(await takeOver(lock, current).catch(() => false))) throw locked();
   }
   throw locked();
 }

@@ -54,6 +54,10 @@ export async function fakeRosebud(t, options = {}) {
     // Awaited with the media path before each media download is answered, as a test's hook.
     beforeMedia: undefined,
     putHeaders: options.putHeaders ?? {}, // more headers each signed upload must carry
+    // Makes every upload session made so far past its lifetime, as a day later.
+    expireSessions: () => {
+      for (const session of game.sessions.values()) session.expired = true;
+    },
     // Canned answers for API routes: { path: "/releases/", status, error, headers, times }.
     // Each is used up `times` (default 1) matching requests, in order, before the real route runs.
     inject: [],
@@ -193,6 +197,20 @@ export async function fakeRosebud(t, options = {}) {
           return fail(res, 400, "noncanonical_path", {
             filename: decomposed.path,
           });
+        // An editor's MP4 or GIF can be kept by linking, never uploaded anew.
+        const unuploadable = body.files.find(
+          (file) =>
+            /\.(mp4|gif)$/.test(file.path) &&
+            !(
+              body.project_id &&
+              game.media.has(file.path) &&
+              md5(game.media.get(file.path)) === file.md5
+            ),
+        );
+        if (unuploadable)
+          return fail(res, 400, "unsupported_file", {
+            filename: unuploadable.path,
+          });
         const id = randomUUID(),
           token = "U".repeat(43);
         const entries = new Map(),
@@ -323,6 +341,13 @@ export async function fakeRosebud(t, options = {}) {
       if (route === `/api/developer/projects/${PROJECT}/releases/`) {
         const fields = await form(req, bytes);
         const operation = fields.get("operation_id");
+        // As Rosebud does, the session is loaded before a retry is matched.
+        if (fields.get("upload_id")) {
+          const session = game.sessions.get(fields.get("upload_id"));
+          if (!session || session.token !== fields.get("upload_token"))
+            return fail(res, 404, "invalid_upload");
+          if (session.expired) return fail(res, 410, "upload_expired");
+        }
         if (game.operations.has(operation))
           return reply(res, 200, game.operations.get(operation));
         if (fields.get("expected_version") !== game.version) {

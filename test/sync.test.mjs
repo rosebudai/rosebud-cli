@@ -188,6 +188,44 @@ test("a missing cover fails before the session or any upload", async (t) => {
   assert.equal(game.requests.length, 0);
 });
 
+test("a media file swapped after packing, for other bytes or a link of the same size, is never sent", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
+  const hero = join(root, "assets/hero.png");
+  const prepared = await prepareRelease(
+    { directory: root },
+    { splitMedia: true },
+  );
+  const publish = () =>
+    new Rosebud({ apiBaseUrl: game.base }).publish({
+      directory: root,
+      prepared,
+    });
+  const changed = (e) =>
+    e.code === "file_changed" &&
+    e.outcome === "not_sent" &&
+    e.message.includes("assets/hero.png");
+  const storage = () =>
+    game.requests.filter((r) => r.path.startsWith("/storage/")).length;
+  await writeFile(hero, Buffer.alloc(png.length, 7));
+  await assert.rejects(publish(), changed);
+  assert.equal(storage(), 0);
+  // A link to a file outside the build, the size the packed file had.
+  const outside = join(await folder(t, { "secret.bin": png }), "secret.bin");
+  await writeFile(outside, Buffer.alloc(png.length, 8));
+  await rm(hero);
+  try {
+    await symlink(outside, hero);
+  } catch (error) {
+    // Windows makes links only with Developer Mode or as an administrator.
+    if (process.platform === "win32") return;
+    throw error;
+  }
+  await assert.rejects(publish(), changed);
+  assert.equal(storage(), 0);
+  assert.equal(game.releases, 0);
+});
+
 test("a file that vanishes before its PUT fails at once as changed, without retries", async (t) => {
   const game = await fakeRosebud(t);
   const root = await folder(t, { "index.html": "x", "assets/hero.png": png });
@@ -707,6 +745,62 @@ test("a disk whose hard links fail in any way but EEXIST still gets the lock, by
   }
 });
 
+test("on a disk without hard links, a takeover never removes the new lock another takeover is still writing", async (t) => {
+  const dir = await folder(t, {});
+  const state = join(dir, "project.json");
+  // Left empty by a command killed as it created it, a minute ago: stale.
+  const lock = `${state}.lock`;
+  await writeFile(lock, "");
+  const minuteAgo = new Date(Date.now() - 60_000);
+  await utimes(lock, minuteAgo, minuteAgo);
+  // B reads the stale lock, then waits while A takes it over and creates its own
+  // lock in place, which is empty until A writes it. Then B goes on.
+  const stub = `
+    fsp.link = async () => {
+      throw Object.assign(new Error("EPERM: no hard links"), { code: "EPERM" });
+    };
+    const realLstat = fsp.lstat, realOpen = fsp.open;
+    let looks = 0, creates = 0;
+    fsp.lstat = async (path, ...rest) => {
+      const info = await realLstat(path, ...rest);
+      if (String(path).endsWith(".lock") && (looks += 1) === 1) await globalThis.firstLook();
+      return info;
+    };
+    fsp.open = async (path, flags, ...rest) => {
+      const file = await realOpen(path, flags, ...rest);
+      if (String(path).endsWith(".lock") && flags === "wx" && (creates += 1) === 1)
+        await globalThis.created();
+      return file;
+    };`;
+  const body = `
+    const [state] = args;
+    const log = [];
+    const inside = (name) => async () => {
+      log.push(name + " in");
+      letA();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      log.push(name + " out");
+    };
+    let letA, aCreated, a;
+    const goA = new Promise((resolve) => (letA = resolve));
+    const createdByA = new Promise((resolve) => (aCreated = resolve));
+    globalThis.firstLook = async () => {
+      a = withStateLock(state, inside("A")).catch((e) => log.push("A " + e.code));
+      await createdByA;
+    };
+    globalThis.created = async () => {
+      aCreated();
+      await goA;
+    };
+    await withStateLock(state, inside("B")).catch((e) => log.push("B " + e.code));
+    letA();
+    await a;
+    console.log(log.join(";"));`;
+  const result = await withStub(stub, body, state);
+  assert.equal(result.out, "B state_locked;A in;A out");
+  assert.deepEqual(await readdir(dir), []);
+});
+
 test("a lock that can't be read is held, not an empty one to take over", async (t) => {
   const dir = await folder(t, {});
   const state = join(dir, "project.json");
@@ -898,6 +992,61 @@ test("after a lost response, a changed media file is different input, not a reru
   const changed = await run(root, ["update", "--directory", "dist"]);
   assert.equal(changed.code, 2);
   assert.equal(changed.error.code, "pending_operation");
+});
+
+test("a rerun after a lost response replays through its saved upload session, even after the editor removes a file a new session would refuse", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, { "index.html": "one" });
+  // An editor MP4 the game serves: a session links it but can never upload it.
+  game.edit({
+    media: {
+      "assets/clip.mp4": Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]),
+    },
+  });
+  const pulled = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pulled.code, 0, JSON.stringify(pulled.error));
+  await writeFile(join(root, "dist/index.html"), "two");
+  game.loseNextRelease = true;
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+  const applied = game.version,
+    releases = game.releases,
+    sessions = game.sessions.size;
+  game.edit({ remove: ["assets/clip.mp4"] });
+  const rerun = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(rerun.data.content_version, applied);
+  assert.equal(game.releases, releases); // replayed, not released again
+  assert.equal(game.sessions.size, sessions); // no new session was asked for
+  assert.equal(await pendingOperation(root), undefined); // nothing left to retry
+});
+
+test("a rerun whose saved upload session has expired declares its media again and still replays", async (t) => {
+  const game = await fakeRosebud(t);
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/big.bin": big,
+  });
+  await writeFile(
+    join(root, "dist/assets/big.bin"),
+    Buffer.alloc(big.length, 9),
+  );
+  game.loseNextRelease = true;
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+  const puts = game.puts.length,
+    releases = game.releases,
+    sessions = game.sessions.size,
+    sent = game.requests.length;
+  game.expireSessions();
+  const rerun = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(game.releases, releases); // replayed, not released twice
+  assert.equal(game.sessions.size, sessions + 1); // the expired one was replaced
+  assert.equal(game.puts.length, puts); // linked: the game already serves it
+  assert.equal(
+    game.requests.slice(sent).filter((r) => r.path.endsWith("/releases/"))
+      .length,
+    2,
+  );
 });
 
 test("planPull keeps local edits, takes Rosebud's, and calls changes on both sides conflicts", () => {

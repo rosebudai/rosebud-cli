@@ -836,6 +836,12 @@ async function main(): Promise<void> {
           };
     credentials.pending = pending;
     await saveState(path, credentials);
+    const staged =
+      resuming &&
+      pending.upload &&
+      Date.parse(pending.upload.expires_at) > Date.now()
+        ? pending.upload
+        : undefined;
     try {
       const result = await api.update({
         ...input,
@@ -847,6 +853,11 @@ async function main(): Promise<void> {
         agentToken: credentials.agent_token,
         expectedVersion: pending.expected_version,
         operationId: pending.operation_id,
+        ...(staged ? { uploadSession: staged } : {}),
+        onUploadSession: async ({ upload_id, upload_token, expires_at }) => {
+          pending.upload = { upload_id, upload_token, expires_at };
+          await saveState(path, credentials);
+        },
       });
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;

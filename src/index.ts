@@ -1,9 +1,8 @@
-import { openAsBlob } from "node:fs";
 import { link, mkdir, open, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { prepareRelease } from "./bundle.js";
+import { prepareRelease, readPacked } from "./bundle.js";
 import type { MediaFile, PreparedRelease } from "./bundle.js";
 import { inputError, isObject, RosebudError } from "./errors.js";
 import type { JsonValue } from "./errors.js";
@@ -141,7 +140,19 @@ export interface ConnectionStatus {
   play_url?: string;
 }
 export type UpdateOptions = ReleaseInput &
-  AgentAuthorization & { expectedVersion: string; operationId: string };
+  AgentAuthorization & {
+    expectedVersion: string;
+    operationId: string;
+    /**
+     * The session an earlier attempt of this operation, with this input, uploaded
+     * its media in. A retry sends it again, so Rosebud can match the attempt even
+     * if a new session would now be refused (the editor removed a file only
+     * linking keeps); one Rosebud no longer takes is replaced by a new session.
+     */
+    uploadSession?: Pick<UploadSession, "upload_id" | "upload_token">;
+    /** Called once the media are uploaded, before the release is sent, to keep the session for a retry. */
+    onUploadSession?: (session: UploadSession) => void | Promise<void>;
+  };
 export interface UpdateResult {
   project_id: string;
   play_url: string;
@@ -389,6 +400,15 @@ function downloadInterrupted(signal: AbortSignal): RosebudError {
 }
 const downloadLimit = 512 * 1024 * 1024;
 const filesLimit = 256 * 1024 * 1024;
+/** Rosebud's refusals of an upload session that a new session would not meet. */
+const SESSION_GONE = new Set([
+  "invalid_upload",
+  "upload_expired",
+  "upload_mismatch",
+  "upload_missing",
+  "upload_corrupt",
+  "upload_stale",
+]);
 /**
  * A failure before the release request: whatever happened to the upload session
  * or its uploads, nothing was released. An answer from Rosebud refused the step;
@@ -840,19 +860,40 @@ export class Rosebud {
         "expected_version",
         "Use the content_version you last accepted for this project.",
       );
-    const form = await this.releaseForm(options, {
-      token: options.agentToken,
-      projectId: options.projectId,
-    });
-    form.append("expected_version", options.expectedVersion);
-    form.append("operation_id", options.operationId);
-    const body = await this.request(
-      `${path}/releases/`,
-      "POST",
-      form,
-      options.agentToken,
-      options.signal,
-    );
+    const release = async (
+      staged?: Pick<UploadSession, "upload_id" | "upload_token">,
+    ) => {
+      const form = await this.releaseForm(
+        options,
+        { token: options.agentToken, projectId: options.projectId },
+        staged,
+        options.onUploadSession,
+      );
+      form.append("expected_version", options.expectedVersion);
+      form.append("operation_id", options.operationId);
+      return this.request(
+        `${path}/releases/`,
+        "POST",
+        form,
+        options.agentToken,
+        options.signal,
+      );
+    };
+    let body: Record<string, JsonValue>;
+    try {
+      body = await release(options.uploadSession);
+    } catch (error) {
+      // Refused for its session alone, this attempt was not applied; one in a new
+      // session still matches an earlier attempt that was, by the same files.
+      if (
+        !options.uploadSession ||
+        !(error instanceof RosebudError) ||
+        error.kind !== "api" ||
+        !SESSION_GONE.has(error.code)
+      )
+        throw error;
+      body = await release();
+    }
     if (
       body.project_id !== options.projectId.toLowerCase() ||
       body.operation_id !== options.operationId.toLowerCase() ||
@@ -1243,22 +1284,9 @@ export class Rosebud {
       2147483647,
       this.timeoutMs + Math.ceil(file.size / (32 * 1024)) * 1000,
     );
+    // Read once, and only as it was packed; every attempt sends the same bytes.
+    const body = await readPacked(file);
     for (let attempt = 1; ; attempt += 1) {
-      // A file that can't be read now won't be by the next attempt.
-      let body: Blob;
-      try {
-        body = await openAsBlob(file.absolute);
-      } catch {
-        throw inputError(
-          "file_changed",
-          `${file.path} could not be read while uploading. Run the command again once the build has finished.`,
-        );
-      }
-      if (body.size !== file.size)
-        throw inputError(
-          "file_changed",
-          `${file.path} changed while uploading. Run the command again once the build has finished.`,
-        );
       let status: number | undefined;
       try {
         // Only the signed headers go: the API credential never reaches storage.
@@ -1300,10 +1328,15 @@ export class Rosebud {
     }
   }
 
-  /** The release form; media goes first through an upload session when Rosebud takes one. */
+  /**
+   * The release form; media goes first through an upload session when Rosebud
+   * takes one, or through `staged`, a session they were already uploaded in.
+   */
   private async releaseForm(
     options: ReleaseInput,
     auth: { token?: string; projectId?: string },
+    staged?: Pick<UploadSession, "upload_id" | "upload_token">,
+    onStaged?: (session: UploadSession) => void | Promise<void>,
   ): Promise<FormData> {
     if (!options || typeof options !== "object")
       throw inputError("input_required", "Provide a directory or ZIP path.");
@@ -1322,14 +1355,17 @@ export class Rosebud {
         ...(options.knownMedia ? { knownMedia: options.knownMedia } : {}),
         ...(options.knownText ? { knownText: options.knownText } : {}),
       }));
-    let session: UploadSession | undefined;
-    if (release.media.length) {
+    let session = release.media.length ? staged : undefined;
+    if (release.media.length && !session) {
+      let fresh: UploadSession | undefined;
       try {
-        session = await this.stage(release.media, auth, options.signal);
+        fresh = await this.stage(release.media, auth, options.signal);
       } catch (error) {
         throw notReleased(error);
       }
-      if (!session) release = await oneZip(options);
+      if (fresh) await onStaged?.(fresh);
+      else release = await oneZip(options);
+      session = fresh;
     }
     const form = metadataForm(options, release.zip, cover);
     if (session) {
