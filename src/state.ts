@@ -46,8 +46,9 @@ export interface Credentials {
     operation_id: string;
     fingerprint: string;
     expected_version: string;
-    /** The session its media went up in, sent again by an identical rerun. */
-    upload?: { upload_id: string; upload_token: string; expires_at: string };
+    /** How its media went, in the ZIP or the session they went up in, as an identical rerun sends them again. */
+    upload?:
+      "zip" | { upload_id: string; upload_token: string; expires_at: string };
   };
 }
 /** The account login, one per API origin, kept apart from project credentials. */

@@ -122,6 +122,29 @@ export async function fakeRosebud(t, options = {}) {
     return { text, media };
   }
 
+  // What Rosebud hashes to match a retry to its operation.
+  async function payloadOf(fields) {
+    const zip = unzipSync(
+      new Uint8Array(await fields.get("bundle").arrayBuffer()),
+    );
+    const thumbnail = fields.get("thumbnail");
+    const session = game.sessions.get(fields.get("upload_id"));
+    return JSON.stringify({
+      bundle: Object.entries(zip)
+        .map(([path, bytes]) => [path, md5(bytes)])
+        .sort(),
+      title: fields.get("title"),
+      description: fields.get("description"),
+      thumbnail: thumbnail
+        ? md5(Buffer.from(await thumbnail.arrayBuffer()))
+        : null,
+      expected_version: fields.get("expected_version"),
+      ...(session
+        ? { session: [...session.entries].map(([p, e]) => [p, e.md5]).sort() }
+        : {}),
+    });
+  }
+
   const app = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -348,8 +371,15 @@ export async function fakeRosebud(t, options = {}) {
             return fail(res, 404, "invalid_upload");
           if (session.expired) return fail(res, 410, "upload_expired");
         }
-        if (game.operations.has(operation))
-          return reply(res, 200, game.operations.get(operation));
+        // A retry matches its operation only by the same ZIP files and metadata, and
+        // the same declared paths and checksums when it has a session.
+        const payload = await payloadOf(fields);
+        if (game.operations.has(operation)) {
+          const earlier = game.operations.get(operation);
+          if (earlier.payload !== payload)
+            return fail(res, 409, "operation_reused");
+          return reply(res, 200, earlier.result);
+        }
         if (fields.get("expected_version") !== game.version) {
           const before = game.manifests.get(fields.get("expected_version"));
           const now = manifest();
@@ -373,7 +403,7 @@ export async function fakeRosebud(t, options = {}) {
           content_version: game.version,
           play_url: "https://example.invalid/p/game",
         };
-        game.operations.set(operation, result);
+        game.operations.set(operation, { payload, result });
         if (game.loseNextRelease) {
           game.loseNextRelease = false;
           return req.socket.destroy();

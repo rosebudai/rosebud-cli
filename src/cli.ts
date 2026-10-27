@@ -838,8 +838,8 @@ async function main(): Promise<void> {
     await saveState(path, credentials);
     const staged =
       resuming &&
-      pending.upload &&
-      Date.parse(pending.upload.expires_at) > Date.now()
+      (pending.upload === "zip" ||
+        (pending.upload && Date.parse(pending.upload.expires_at) > Date.now()))
         ? pending.upload
         : undefined;
     try {
@@ -853,9 +853,16 @@ async function main(): Promise<void> {
         agentToken: credentials.agent_token,
         expectedVersion: pending.expected_version,
         operationId: pending.operation_id,
-        ...(staged ? { uploadSession: staged } : {}),
-        onUploadSession: async ({ upload_id, upload_token, expires_at }) => {
-          pending.upload = { upload_id, upload_token, expires_at };
+        ...(staged ? { upload: staged } : {}),
+        onUpload: async (upload) => {
+          pending.upload =
+            upload === "zip"
+              ? upload
+              : {
+                  upload_id: upload.upload_id,
+                  upload_token: upload.upload_token,
+                  expires_at: upload.expires_at,
+                };
           await saveState(path, credentials);
         },
       });

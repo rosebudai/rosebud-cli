@@ -1049,6 +1049,26 @@ test("a rerun whose saved upload session has expired declares its media again an
   );
 });
 
+test("a rerun after a lost response sends its media in one ZIP as the attempt did, even once Rosebud takes upload sessions", async (t) => {
+  const game = await fakeRosebud(t, { sync: false });
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  await writeFile(join(root, "dist/index.html"), "two");
+  game.loseNextRelease = true;
+  assert.equal((await run(root, ["update", "--directory", "dist"])).code, 4);
+  const applied = game.version,
+    releases = game.releases;
+  game.sync = true;
+  const rerun = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(rerun.code, 0, JSON.stringify(rerun.error));
+  assert.equal(rerun.data.content_version, applied);
+  assert.equal(game.releases, releases); // replayed, not released again
+  assert.equal(game.sessions.size, 0); // sent as before, in one ZIP
+  assert.equal(await pendingOperation(root), undefined); // nothing left to retry
+});
+
 test("planPull keeps local edits, takes Rosebud's, and calls changes on both sides conflicts", () => {
   const m = (o) => new Map(Object.entries(o));
   const base = m({

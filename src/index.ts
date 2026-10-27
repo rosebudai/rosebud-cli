@@ -144,14 +144,16 @@ export type UpdateOptions = ReleaseInput &
     expectedVersion: string;
     operationId: string;
     /**
-     * The session an earlier attempt of this operation, with this input, uploaded
-     * its media in. A retry sends it again, so Rosebud can match the attempt even
-     * if a new session would now be refused (the editor removed a file only
-     * linking keeps); one Rosebud no longer takes is replaced by a new session.
+     * How an earlier attempt of this operation, with this input, sent its media:
+     * "zip" inside the release ZIP, from a Rosebud that took no upload session, or
+     * the session it uploaded them in. Rosebud matches a retry by its files and how
+     * they came, so a retry sends them the same way, even once Rosebud takes
+     * sessions or when a new session would be refused (the editor removed a file
+     * only linking keeps). A session Rosebud no longer takes is replaced by a new one.
      */
-    uploadSession?: Pick<UploadSession, "upload_id" | "upload_token">;
-    /** Called once the media are uploaded, before the release is sent, to keep the session for a retry. */
-    onUploadSession?: (session: UploadSession) => void | Promise<void>;
+    upload?: "zip" | Pick<UploadSession, "upload_id" | "upload_token">;
+    /** Called with how the media are sent, before the release is, to keep for a retry. */
+    onUpload?: (upload: "zip" | UploadSession) => void | Promise<void>;
   };
 export interface UpdateResult {
   project_id: string;
@@ -861,13 +863,13 @@ export class Rosebud {
         "Use the content_version you last accepted for this project.",
       );
     const release = async (
-      staged?: Pick<UploadSession, "upload_id" | "upload_token">,
+      staged?: "zip" | Pick<UploadSession, "upload_id" | "upload_token">,
     ) => {
       const form = await this.releaseForm(
         options,
         { token: options.agentToken, projectId: options.projectId },
         staged,
-        options.onUploadSession,
+        options.onUpload,
       );
       form.append("expected_version", options.expectedVersion);
       form.append("operation_id", options.operationId);
@@ -881,12 +883,12 @@ export class Rosebud {
     };
     let body: Record<string, JsonValue>;
     try {
-      body = await release(options.uploadSession);
+      body = await release(options.upload);
     } catch (error) {
       // Refused for its session alone, this attempt was not applied; one in a new
       // session still matches an earlier attempt that was, by the same files.
       if (
-        !options.uploadSession ||
+        typeof options.upload !== "object" ||
         !(error instanceof RosebudError) ||
         error.kind !== "api" ||
         !SESSION_GONE.has(error.code)
@@ -1330,13 +1332,14 @@ export class Rosebud {
 
   /**
    * The release form; media goes first through an upload session when Rosebud
-   * takes one, or through `staged`, a session they were already uploaded in.
+   * takes one, or as `staged` says: in the ZIP, or through a session they were
+   * already uploaded in.
    */
   private async releaseForm(
     options: ReleaseInput,
     auth: { token?: string; projectId?: string },
-    staged?: Pick<UploadSession, "upload_id" | "upload_token">,
-    onStaged?: (session: UploadSession) => void | Promise<void>,
+    staged?: "zip" | Pick<UploadSession, "upload_id" | "upload_token">,
+    onStaged?: (upload: "zip" | UploadSession) => void | Promise<void>,
   ): Promise<FormData> {
     if (!options || typeof options !== "object")
       throw inputError("input_required", "Provide a directory or ZIP path.");
@@ -1355,16 +1358,18 @@ export class Rosebud {
         ...(options.knownMedia ? { knownMedia: options.knownMedia } : {}),
         ...(options.knownText ? { knownText: options.knownText } : {}),
       }));
-    let session = release.media.length ? staged : undefined;
-    if (release.media.length && !session) {
+    let session = release.media.length && staged !== "zip" ? staged : undefined;
+    if (release.media.length && staged === "zip")
+      release = await oneZip(options);
+    else if (release.media.length && !session) {
       let fresh: UploadSession | undefined;
       try {
         fresh = await this.stage(release.media, auth, options.signal);
       } catch (error) {
         throw notReleased(error);
       }
-      if (fresh) await onStaged?.(fresh);
-      else release = await oneZip(options);
+      if (!fresh) release = await oneZip(options);
+      await onStaged?.(fresh ?? "zip");
       session = fresh;
     }
     const form = metadataForm(options, release.zip, cover);
