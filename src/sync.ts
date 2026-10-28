@@ -84,8 +84,8 @@ const caseDiffers = (a: string, b: string) =>
  * `force` settles conflicts for Rosebud and restores files missing here; an edit
  * or new file made only here is never touched.
  *
- * Names are matched the way the disk matches them (`disk.fold`): a local file
- * spelled differently from Rosebud's is the same file, so an edit to it is never
+ * Names are matched by `disk.fold` (see `diskNames`): a local file spelled
+ * differently from Rosebud's is the same file, so an edit to it is never
  * overwritten unseen. A difference in letter case counts as a change of name,
  * compared with the last sync like any other change; a difference only in Unicode
  * form does not, and Rosebud's text lands on the local file under its local name.
@@ -364,44 +364,41 @@ async function localFiles(root: string): Promise<{
 }
 
 /**
- * How the disk compares names, learned once per pull from a scratch file in
- * `scratch`, so nothing is ever created in the game's folder. macOS and Windows
- * disks fold letter case by default, and macOS also folds Unicode form (an accented
- * letter as one character or two). When `scratch` sits on another disk than the folder, the
- * answer can't speak for the folder, so both are folded: refusing a pair of names
- * the disk could have kept apart is safe, overwriting one with the other is not.
+ * How names are matched. Unicode form (an accented letter as one character or two)
+ * never counts, on any disk: Rosebud names every file in NFC and an update sends
+ * each name so, so two local names differing only in form are one file to Rosebud.
+ * Letter case counts unless the disk folds it, as macOS and Windows disks do by
+ * default; that is learned once per pull from a scratch file in `scratch`, so
+ * nothing is ever created in the game's folder. When `scratch` sits on another
+ * disk than the folder, the answer can't speak for the folder, so case is folded:
+ * refusing a pair of names the disk could have kept apart is safe, overwriting one
+ * with the other is not.
  */
 export async function diskNames(
   directory: string,
   scratch: string,
 ): Promise<(path: string) => string> {
-  let foldsCase = true,
-    foldsForm = true;
+  let foldsCase = true;
   try {
     await mkdir(scratch, { recursive: true });
     if ((await lstat(directory)).dev === (await lstat(scratch)).dev) {
-      const id = randomUUID();
-      // A capital A, then e and a combining acute accent: é in its decomposed (NFD) form.
-      const probe = join(scratch, `${id}-Ae\u0301`);
-      await writeFile(probe, "", { flag: "wx" });
-      const found = (name: string) =>
-        lstat(join(scratch, name)).then(
+      const probe = join(scratch, randomUUID());
+      await writeFile(`${probe}-A`, "", { flag: "wx" });
+      try {
+        foldsCase = await lstat(`${probe}-a`).then(
           () => true,
           () => false,
         );
-      try {
-        foldsCase = await found(`${id}-ae\u0301`);
-        foldsForm = await found(`${id}-A\u00e9`);
       } finally {
-        await unlink(probe);
+        await unlink(`${probe}-A`);
       }
     }
   } catch {
-    // A disk that can't be asked is treated as folding both, the safe side.
-    foldsCase = foldsForm = true;
+    // A disk that can't be asked is treated as folding case, the safe side.
+    foldsCase = true;
   }
   return (path) => {
-    const form = foldsForm ? path.normalize("NFC") : path;
+    const form = path.normalize("NFC");
     // Upper then lower case covers more pairs than either alone (ß and SS, ſ and s).
     return foldsCase ? form.toUpperCase().toLowerCase() : form;
   };
@@ -573,9 +570,18 @@ export async function pullInto(options: {
     const file = media.get(path);
     if (!file) throw corrupt(path);
     const to = join(incoming, randomUUID());
-    await api.downloadAsset({ url: file.url, path: to, overwrite: true });
+    const size = await api.downloadAsset({
+      url: file.url,
+      path: to,
+      overwrite: true,
+    });
     const md5 = await md5File(to);
-    if (file.md5 !== null && md5 !== file.md5) throw corrupt(path);
+    // Without an MD5, the size is all there is to check a download against.
+    if (
+      (file.size !== null && size !== file.size) ||
+      (file.md5 !== null && md5 !== file.md5)
+    )
+      throw corrupt(path);
     const got = { to, md5 };
     held.set(path, got);
     return got;

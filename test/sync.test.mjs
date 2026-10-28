@@ -2174,6 +2174,21 @@ test("a download that fails its MD5 is refused and never replaces the file or mo
   assert.deepEqual(await handle(root), before);
 });
 
+test("a download without an MD5 that is shorter than Rosebud's size is refused and never replaces the file", async (t) => {
+  const game = await fakeRosebud(t, { hideMd5: true, damageMedia: true });
+  const root = await connected(t, game, {
+    "index.html": "one",
+    "assets/hero.png": png,
+  });
+  game.edit({ media: { "assets/hero.png": Buffer.concat([png, png]) } });
+  const before = await handle(root);
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.error.code, "download_corrupt");
+  assert.deepEqual(await readFile(join(root, "dist/assets/hero.png")), png);
+  assert.deepEqual(await readdir(join(root, "dist/assets")), ["hero.png"]);
+  assert.deepEqual(await handle(root), before);
+});
+
 test("media without an MD5 is downloaded once, then moved into place", async (t) => {
   const game = await fakeRosebud(t, { hideMd5: true });
   const root = await connected(t, game, {
@@ -3327,8 +3342,6 @@ test("a local edit to a file Rosebud names in another Unicode form is never over
     await readFile(join(root, "dist", nfd), "utf8"),
     "MY LOCAL EDIT",
   );
-  // A disk that keeps both forms apart holds two files, and nothing was lost.
-  if (!(await formInsensitiveDisk(t))) return;
   // One file here, unchanged in Rosebud since the last sync: the edit is the agent's own.
   assert.equal(pull.data.status, "synced");
   assert.deepEqual(
@@ -3358,6 +3371,32 @@ test("a local edit to a file Rosebud names in another Unicode form is never over
     "index.html",
   ]);
   assert.equal(await readFile(join(root, "dist", nfd), "utf8"), "rosie's");
+  // And it goes back up as the one file it is.
+  await writeFile(join(root, "dist", nfd), "mine again");
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.equal(game.text.get(nfc), "mine again");
+});
+
+test("a media file published under another Unicode form takes Rosebud's change in place, then updates", async (t) => {
+  const nfd = "assets/cafe\u0301.png",
+    nfc = "assets/caf\u00e9.png";
+  const game = await fakeRosebud(t, { nfc: true });
+  const root = await connected(t, game, { "index.html": "x", [nfd]: png });
+  assert.deepEqual([...game.media.keys()], [nfc]);
+  const theirs = Buffer.concat([png, png]);
+  game.edit({ media: { [nfc]: theirs } });
+  const pull = await run(root, ["pull", "--directory", "dist"]);
+  assert.equal(pull.code, 0, JSON.stringify(pull.error));
+  assert.equal(pull.data.status, "synced");
+  assert.deepEqual(pull.data.written, [nfc]);
+  assert.deepEqual(await readdir(join(root, "dist/assets")), [
+    "cafe\u0301.png",
+  ]);
+  assert.deepEqual(await readFile(join(root, "dist", nfd)), theirs);
+  const update = await run(root, ["update", "--directory", "dist"]);
+  assert.equal(update.code, 0, JSON.stringify(update.error));
+  assert.deepEqual([...game.media.keys()], [nfc]);
 });
 
 test("a path Rosebud holds keeps its type when the folder spells it in another Unicode form", async (t) => {
@@ -3382,8 +3421,6 @@ test("a path Rosebud holds keeps its type when the folder spells it in another U
 });
 
 test("an unchanged editor SVG that the folder spells in another Unicode form stays text on update", async (t) => {
-  if (!(await formInsensitiveDisk(t)))
-    return t.skip("this file system keeps Unicode forms apart");
   const nfd = "assets/cafe\u0301.svg",
     nfc = "assets/caf\u00e9.svg";
   const game = await fakeRosebud(t, { nfc: true });
@@ -3451,8 +3488,6 @@ test("two local names that are one name in Unicode NFC are refused as duplicate_
 });
 
 test("an unchanged media file that the folder spells in another Unicode form is linked on update", async (t) => {
-  if (!(await formInsensitiveDisk(t)))
-    return t.skip("this file system keeps Unicode forms apart");
   const nfd = "assets/cafe\u0301.png",
     nfc = "assets/caf\u00e9.png";
   const game = await fakeRosebud(t, { nfc: true });
