@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { prepareBundle } from "./bundle.js";
+import { prepareRelease } from "./bundle.js";
+import type { PreparedRelease } from "./bundle.js";
 import {
+  GAME_FILES,
   Rosebud,
   RosebudError,
   publishedToAccount,
@@ -22,13 +24,16 @@ import type {
   LoginStatus,
 } from "./index.js";
 import { inputError, isObject } from "./errors.js";
+import { pullInto } from "./sync.js";
+import type { PullPlan, SkipReason } from "./sync.js";
 import {
   accountPath,
   assetRequestPath,
   credentialPath,
-  outsideBuild,
+  outsideBuildOnDisk,
   prepareCredentials,
   readState,
+  releaseLocks,
   removeState,
   saveState,
   withStateLock,
@@ -53,11 +58,14 @@ const help = `Rosebud CLI — publish and update browser-ready games
   rosebud publish --directory ./dist --title <title> --description <text>
   rosebud connect [--project <id>] [--agent-client codex]
   rosebud status
+  rosebud pull --directory ./game [--force]
   rosebud update --directory ./dist [--title <title>] [--thumbnail ./cover.png]
   rosebud disconnect
 
 Common: --state <file> (default .rosebud/project.json), --timeout-ms <ms>, --help, --version
 Uploads: exactly one --directory or --zip; optional --title, --description, --thumbnail.
+Media goes file by file: up to 19 MiB per file and 2,000 files / 1 GiB per game; text files
+travel in one ZIP of up to 10 MiB.
 Optional first-upload context: --context <JSON file>, --agent-client <client>.
 --name remains a title alias. Rosebud is the default destination; no configuration needed.
 
@@ -71,6 +79,11 @@ connect returns a PRIVATE sign-in
 link; the human must approve before update works. status checks approval without
 silently accepting remote edits. After reconciling a conflict, explicitly pass
 --expected-version <version from status> to update.
+
+pull brings the game's current files, including edits made in Rosebud, into a folder.
+Local edits are kept; files changed on both sides are listed as conflicts, with Rosebud's
+copy saved beside the state file. Reading files back needs the game owner's plan to include
+code download.
 
 Update retries reuse the saved operation ID for identical input. After an uncertain
 response, rerun the same update. Changed input requires explicit reconciliation.
@@ -88,6 +101,7 @@ Make assets with the person's Rosebud credits:
   rosebud assets download <asset_id> --out <file>
 
 login returns a PRIVATE approval link; the human must approve before assets work.
+A login expires after 90 days without use; whoami shows its scopes and expires_at.
 --prompt fills the model's prompt input; --input sets any other input it lists
 (repeatable), and --input-json <file> supplies inputs as one JSON object.
 create quotes first, refuses a quote above --max-credits, then waits up to
@@ -98,7 +112,8 @@ create finishes, the same command makes a new asset.
 
 Credentials live separately under ~/.config/rosebud/credentials (mode 0600).
 Keep .rosebud/ out of Git and keep state outside your build output.
-JSON goes to stdout; errors to stderr. Exit 2 input, 3 HTTP rejection, 4 unknown outcome.
+JSON goes to stdout; errors to stderr. Exit 2 input, 3 HTTP rejection, 4 unknown outcome,
+130 or 143 stopped by SIGINT or SIGTERM. Big uploads and pulls can take minutes.
 `;
 const strings = [
   "directory",
@@ -127,6 +142,7 @@ const projectCommands = [
   "connect",
   "status",
   "update",
+  "pull",
   "disconnect",
 ];
 /** Positional arguments each assets subcommand takes, including "assets". */
@@ -138,8 +154,203 @@ const assetCommands: Record<string, number> = {
   list: 2,
   download: 3,
 };
+/**
+ * What Rosebud now holds, and the folder it came from, so a later pull into that
+ * folder can tell local edits from Rosebud's.
+ */
+async function remember(
+  handle: ProjectHandle,
+  release: PreparedRelease,
+  directory: string | undefined,
+): Promise<void> {
+  if (release.files && release.mediaPaths && directory !== undefined) {
+    handle.files = release.files;
+    handle.media = release.mediaPaths;
+    handle.directory = await canonical(directory);
+  } else {
+    // A ZIP the CLI didn't build: unknown contents, so a pull compares everything.
+    delete handle.files;
+    delete handle.media;
+    delete handle.directory;
+  }
+}
+/** A folder as the disk names it, links resolved; as given when it doesn't exist. */
+async function canonical(directory: string): Promise<string> {
+  return realpath(directory).catch(() => resolve(directory));
+}
+/**
+ * Whether two spellings name one folder: the same real path, or, for another
+ * letter case on a disk that ignores it, the very same folder on disk. A folder
+ * rebuilt at the same path is still the same folder.
+ */
+async function sameFolder(a: string, b: string): Promise<boolean> {
+  if ((await canonical(a)) === (await canonical(b))) return true;
+  const [x, y] = await Promise.all(
+    [a, b].map((path) => stat(path, { bigint: true }).catch(() => undefined)),
+  );
+  return (
+    x !== undefined &&
+    y !== undefined &&
+    x.isDirectory() &&
+    x.dev === y.dev &&
+    x.ino === y.ino &&
+    // Some filesystems report no inode numbers; zero names no particular folder.
+    x.ino !== 0n
+  );
+}
+/** An argument that can be pasted into a shell as one word. */
+function shellArg(arg: string): string {
+  if (/^[\w@+=:,./-]+$/.test(arg)) return arg;
+  return process.platform === "win32"
+    ? `"${arg}"`
+    : `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+/** The flags that aim a command at this game's folder and state file. */
+function gameFlags(
+  directory: string | undefined,
+  state: string | undefined,
+): string {
+  const folder =
+    directory === undefined ? "<your game folder>" : shellArg(directory);
+  return `--directory ${folder}${state === undefined ? "" : ` --state ${shellArg(state)}`}`;
+}
+/** A name from Rosebud, set in backticks so no sentence punctuation sticks to it. */
+function quoted(name: string): string {
+  return `\`${name.replace(/[\u0000-\u001f\u007f`]/gu, "?")}\``;
+}
+/** What to do after a pull, with commands that target this game and can be pasted as they are. */
+function pullAdvice(options: {
+  directory: string;
+  state: string | undefined;
+  conflicts: PullPlan["conflicts"];
+  missing: string[];
+  hidden: string[];
+  skipped: { path: string; reason: SkipReason }[];
+  remoteCopies: string;
+  version: string;
+  /** Set when this folder has no last sync, with where the last one was, if anywhere. */
+  lastSync: { directory?: string } | undefined;
+}): string {
+  const { directory, state, conflicts, missing, hidden, skipped, version } =
+    options;
+  const flags = gameFlags(directory, state);
+  const has = (reason: PullPlan["conflicts"][number]["reason"]) =>
+    conflicts.some((c) => c.reason === reason);
+  const notes: string[] = [];
+  // Deleted on purpose or lost, these look the same; say what the next update does with them.
+  const one = missing.length === 1;
+  const restore =
+    missing.length === 0
+      ? ""
+      : `${one ? "1 file Rosebud has is" : `${missing.length} files Rosebud has are`} missing here: ${missing
+          .slice(0, 10)
+          .map(quoted)
+          .join(
+            ", ",
+          )}${missing.length > 10 ? ", …" : ""}; your next update removes ${one ? "it" : "them"} from the game unless you restore ${one ? "it" : "them"}, and \`rosebud pull ${flags} --force\` restores ${one ? "it" : "them"}${conflicts.length > 0 ? ", though it also settles the conflicts above for Rosebud, discarding your edits to those files" : ""}.`;
+  if (restore && conflicts.length > 0) notes.push(restore);
+  if (skipped.some((s) => s.reason === "unsafe_path"))
+    notes.push(
+      "Rosebud has files whose names can't be saved here (skipped); your next update removes them from the game unless you rename them in Rosebud first.",
+    );
+  if (hidden.length > 0)
+    notes.push(
+      `Update refuses hidden files and folders, and ${directory} holds ${hidden
+        .slice(0, 3)
+        .map(quoted)
+        .join(
+          ", ",
+        )}${hidden.length > 3 ? ", …" : ""}: move them out, or update from a folder without them.`,
+    );
+  if (skipped.some((s) => s.reason === "duplicate_path"))
+    notes.push(
+      "Rosebud lists some paths twice (duplicate_path); the first copy of each was kept.",
+    );
+  // Clashing names are not edits on both sides, so they get their own words.
+  const clashes = conflicts.filter((c) => c.reason === "case_conflict");
+  const collisions = conflicts.filter((c) => c.reason === "name_collision");
+  const edits = conflicts.filter(
+    (c) => c.reason !== "case_conflict" && c.reason !== "name_collision",
+  );
+  const steps =
+    conflicts.length === 0
+      ? [
+          restore
+            ? `${restore} Apart from that, ${directory} holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`
+            : `${directory} now holds Rosebud's current version. Edit it, then run \`rosebud update ${flags}\`.`,
+        ]
+      : [
+          ...(edits.length > 0
+            ? [
+                options.lastSync === undefined
+                  ? `These files changed both here and in Rosebud: ${edits.map((c) => quoted(c.path)).join(", ")}.`
+                  : `These files differ here and in Rosebud, and there is no last sync for this folder to tell which side changed them${options.lastSync.directory === undefined ? "" : ` (last: ${quoted(options.lastSync.directory)})`}: ${edits.map((c) => quoted(c.path)).join(", ")}.`,
+              ]
+            : []),
+          ...(collisions.length > 0
+            ? [
+                `This disk can't tell apart names that differ only by letter case or Unicode form, so pull wrote none of these Rosebud files: ${collisions.map((c) => quoted(c.path)).join(", ")}. Rename them in Rosebud so no two clash, then pull again; or keep each under its own name here, fixing what refers to it. Pull left the saved version where it was.`,
+              ]
+            : []),
+          ...(has("both_changed") ||
+          has("local_deleted") ||
+          has("case_conflict") ||
+          has("name_collision")
+            ? [`Rosebud's copies are in ${quoted(options.remoteCopies)}.`]
+            : []),
+          ...(has("both_changed")
+            ? ["Merge each into your file, keeping both changes."]
+            : []),
+          ...(has("local_deleted")
+            ? [
+                "A file you deleted that Rosebud changed: restore it from Rosebud's copy or leave it deleted.",
+              ]
+            : []),
+          ...(has("remote_deleted")
+            ? [
+                "A file Rosebud deleted has no copy: keep it to restore it, or delete it.",
+              ]
+            : []),
+          ...(clashes.length > 0
+            ? [
+                `This disk treats names that differ only by letter case as one, so pull did not write ${clashes.map((c) => `Rosebud's ${quoted(c.path)}, which clashes with your ${quoted(c.clashesWith ?? c.path)}`).join("; ")}. Rename each of your files or folders to Rosebud's name and merge Rosebud's copy into it, keeping both changes.`,
+              ]
+            : []),
+          `Then run \`rosebud update ${flags} --expected-version ${version}\`.${edits.length > 0 ? ` \`rosebud pull ${flags} --force\` takes Rosebud's version of these files instead.` : ""}`,
+        ];
+  return [...steps, ...notes].join(" ");
+}
+/** A handle's manifest is plain data; anything else is corrupt or hand-edited. */
+function malformedManifest(handle: ProjectHandle): boolean {
+  const { files, media } = handle as { files?: unknown; media?: unknown };
+  return (
+    (files !== undefined &&
+      !(
+        isObject(files) &&
+        Object.values(files).every((v) => typeof v === "string")
+      )) ||
+    (media !== undefined &&
+      !(Array.isArray(media) && media.every((v) => typeof v === "string"))) ||
+    (handle.directory !== undefined && typeof handle.directory !== "string") ||
+    (handle.pull_conflicts !== undefined &&
+      !(
+        isObject(handle.pull_conflicts) &&
+        typeof handle.pull_conflicts.content_version === "string" &&
+        Array.isArray(handle.pull_conflicts.paths) &&
+        handle.pull_conflicts.paths.every((v) => typeof v === "string")
+      ))
+  );
+}
 /** Ids that help recover from an error, added to its JSON. */
 const errorContext: { job_id?: string; asset_id?: string } = {};
+/** What to do about a refusal the CLI makes itself, when it needs more than the error code to say. */
+const refusalAdvice: { next_action?: string } = {};
+/** What was asked, so an error's next step can name this game's folder and state file. */
+const invocation: {
+  command: string;
+  directory: string | undefined;
+  state: string | undefined;
+} = { command: "", directory: undefined, state: undefined };
 
 async function main(): Promise<void> {
   let args: ReturnType<typeof parseArgs>;
@@ -182,6 +393,10 @@ async function main(): Promise<void> {
     return;
   }
   const command = positionals[0] ?? "";
+  invocation.command =
+    command === "assets" ? `assets ${positionals[1] ?? ""}` : command;
+  invocation.directory = value("directory");
+  invocation.state = value("state");
   const client = value("agent-client") ?? "unknown";
   if (
     ![
@@ -215,7 +430,7 @@ async function main(): Promise<void> {
   if (positionals.length !== 1 || !projectCommands.includes(command))
     throw inputError(
       "usage",
-      "Choose publish, connect, status, update, disconnect, login, whoami, logout or assets.",
+      "Choose publish, connect, status, update, pull, disconnect, login, whoami, logout or assets.",
     );
   const directory = value("directory"),
     zip = value("zip");
@@ -225,6 +440,11 @@ async function main(): Promise<void> {
       "input_required",
       "Choose exactly one --directory or --zip.",
     );
+  if (command === "pull" && (directory === undefined || zip !== undefined))
+    throw inputError(
+      "input_required",
+      "Use --directory with the folder to bring the game into.",
+    );
   const input: BundleInput =
     directory !== undefined ? { directory } : { zip: zip ?? "" };
   const metadata: GameMetadata = {};
@@ -233,7 +453,7 @@ async function main(): Promise<void> {
     if (v !== undefined) metadata[key] = v;
   }
   const statePath = resolve(value("state") ?? ".rosebud/project.json");
-  outsideBuild(statePath, directory);
+  await outsideBuildOnDisk(statePath, directory);
 
   await withStateLock(statePath, async () => {
     let handle = await readState<ProjectHandle>(statePath);
@@ -241,7 +461,8 @@ async function main(): Promise<void> {
       handle &&
       (handle.version !== 1 ||
         typeof handle.api_base_url !== "string" ||
-        typeof handle.project_id !== "string")
+        typeof handle.project_id !== "string" ||
+        malformedManifest(handle))
     )
       throw inputError("state_format", "This project handle is not supported.");
     const configuredBase = value("api-base") ?? process.env.ROSEBUD_API_BASE;
@@ -275,14 +496,16 @@ async function main(): Promise<void> {
         api_base_url: api.apiBaseUrl,
         project_id: "new-project",
       });
-      outsideBuild(destination, directory);
+      await outsideBuildOnDisk(destination, directory);
       await prepareCredentials(destination);
       const login = await readAccount(
         accountPath(api.apiBaseUrl),
         api.apiBaseUrl,
       );
+      const release = await prepareRelease(input, { splitMedia: true });
       const result = await api.publish({
         ...input,
+        prepared: release,
         ...metadata,
         ...(login ? { token: login.token } : {}),
         context: {
@@ -303,8 +526,9 @@ async function main(): Promise<void> {
       };
       if (!publishedToAccount(result))
         handle.claim_expires_at = result.claim_expires_at;
+      await remember(handle, release, directory);
       const path = credentialPath(statePath, handle);
-      outsideBuild(path, directory);
+      await outsideBuildOnDisk(path, directory);
       await prepareCredentials(path);
       if (publishedToAccount(result)) {
         const { agent_token: agentToken, ...shown } = result;
@@ -317,7 +541,7 @@ async function main(): Promise<void> {
         output({
           ...shown,
           state_file: statePath,
-          next_action: `This game is in ${result.owner}'s Rosebud account; nothing to claim. Ship new builds to the same link with rosebud update and this state file.`,
+          next_action: `This game is in ${result.owner}'s Rosebud account; nothing to claim. Ship new builds to the same link with \`rosebud update\` and this state file.`,
         });
         return;
       }
@@ -330,7 +554,7 @@ async function main(): Promise<void> {
       output({
         ...result,
         state_file: statePath,
-        next_action: `Claim by ${result.claim_expires_at} to keep this game online for free. Unclaimed uploads are permanently deleted after one hour. Run rosebud connect with this state file, then give its private approval link to the person.`,
+        next_action: `Claim by ${result.claim_expires_at} to keep this game online for free. Unclaimed uploads are permanently deleted after one hour. Run \`rosebud connect\` with this state file, then give its private approval link to the person.`,
       });
       return;
     }
@@ -358,7 +582,7 @@ async function main(): Promise<void> {
         "This state belongs to another project. Choose a separate --state file.",
       );
     const path = credentialPath(statePath, handle);
-    outsideBuild(path, directory);
+    await outsideBuildOnDisk(path, directory);
     await prepareCredentials(path);
     let credentials = (await readState<Credentials>(path)) ?? {
       api_base_url: api.apiBaseUrl,
@@ -445,6 +669,79 @@ async function main(): Promise<void> {
         "connection_required",
         "Run rosebud connect and have the person approve access.",
       );
+    if (command === "pull") {
+      const remoteCopies = `${statePath.replace(/\.json$/i, "")}.remote`;
+      await outsideBuildOnDisk(remoteCopies, directory);
+      const folder = resolve(directory ?? "");
+      // The last sync describes the folder it happened in, not this one.
+      const synced =
+        handle.files !== undefined &&
+        handle.directory !== undefined &&
+        (await sameFolder(handle.directory, folder));
+      const game = await api.files({
+        projectId: handle.project_id,
+        agentToken: credentials.agent_token,
+      });
+      const pulled = await pullInto({
+        api,
+        game,
+        directory: folder,
+        remoteCopies,
+        ...(synced && handle.files ? { base: handle.files } : {}),
+        force: values.force === true,
+      });
+      const conflicts = pulled.plan.conflicts;
+      // Without a last sync of this folder, nothing says who changed these files.
+      const lastSync = synced
+        ? undefined
+        : handle.files !== undefined && handle.directory !== undefined
+          ? { directory: handle.directory }
+          : {};
+      handle.files = pulled.files;
+      handle.media = pulled.media;
+      handle.directory = await canonical(folder);
+      // A conflicted pull keeps the old version, and is remembered: update stays
+      // blocked until the agent merges and names the version it merged against,
+      // even when the saved version is already Rosebud's (a game just connected).
+      if (conflicts.length === 0) {
+        handle.content_version = game.content_version;
+        delete handle.pull_conflicts;
+      } else
+        handle.pull_conflicts = {
+          content_version: game.content_version,
+          paths: conflicts.map(({ path }) => path),
+        };
+      await saveState(statePath, handle);
+      output({
+        project_id: handle.project_id,
+        content_version: game.content_version,
+        directory: folder,
+        status: conflicts.length > 0 ? "conflicts" : "synced",
+        written: pulled.plan.write,
+        removed: pulled.plan.remove,
+        local_only: pulled.plan.localOnly,
+        missing_locally: pulled.plan.missing,
+        conflicts: conflicts.map(({ path, reason, clashesWith }) => ({
+          path,
+          reason,
+          rosebud_copy: pulled.copies[path] ?? null,
+          ...(clashesWith !== undefined ? { clashes_with: clashesWith } : {}),
+        })),
+        skipped: pulled.skipped,
+        next_action: pullAdvice({
+          directory: directory ?? "",
+          state: value("state"),
+          conflicts,
+          missing: pulled.plan.missing,
+          hidden: pulled.hidden,
+          skipped: pulled.skipped,
+          remoteCopies,
+          version: game.content_version,
+          lastSync,
+        }),
+      });
+      return;
+    }
     if (command === "disconnect") {
       await api.disconnect({
         projectId: handle.project_id,
@@ -462,12 +759,53 @@ async function main(): Promise<void> {
         "version_required",
         "Run status after approval to establish this connection's initial version.",
       );
-    const bytes = await prepareBundle(input);
+    const flags = gameFlags(directory, value("state"));
+    // The same flags for a ZIP, which names no folder.
+    const releaseFlags =
+      zip === undefined
+        ? flags
+        : `--zip ${shellArg(zip)}${value("state") === undefined ? "" : ` --state ${shellArg(value("state") ?? "")}`}`;
+    // Without an explicit version, release only the folder the last sync knows.
+    if (
+      value("expected-version") === undefined &&
+      directory !== undefined &&
+      handle.directory !== undefined &&
+      !(await sameFolder(handle.directory, directory))
+    ) {
+      const here = await canonical(directory);
+      refusalAdvice.next_action = `Updating from ${directory} would release its files as they are and undo what the last sync brought into ${quoted(handle.directory)}. Run \`rosebud pull ${flags}\` first, then update; or, to release this folder as it is, run \`rosebud update ${flags} --expected-version ${expectedVersion}\`.`;
+      throw inputError(
+        "directory_mismatch",
+        `This game's last sync was with ${handle.directory}, not ${here}.`,
+      );
+    }
+    if (value("expected-version") === undefined && handle.pull_conflicts) {
+      const { paths, content_version: pulled } = handle.pull_conflicts;
+      refusalAdvice.next_action = `Resolve them as that pull's next_action said, then run \`rosebud update ${releaseFlags} --expected-version ${pulled}\` to release the result. A pull that reports no conflicts also lifts this.`;
+      throw inputError(
+        "pull_conflicts",
+        `The last pull left ${paths.length === 1 ? "a conflict" : `${paths.length} conflicts`} unresolved: ${paths
+          .slice(0, 10)
+          .map(quoted)
+          .join(", ")}${paths.length > 10 ? ", …" : ""}.`,
+      );
+    }
+    const knownMedia = new Set(handle.media ?? []);
+    // Rosebud holds these as text, whatever their extension (a Rosie-written icon.svg).
+    const knownText = new Set(
+      Object.keys(handle.files ?? {}).filter((path) => !knownMedia.has(path)),
+    );
+    const release = await prepareRelease(input, {
+      splitMedia: true,
+      knownMedia,
+      knownText,
+    });
     const cover = metadata.thumbnail
       ? await readCover(metadata.thumbnail)
       : undefined;
     const fingerprint = createHash("sha256")
-      .update(bytes)
+      .update(release.zip)
+      .update(JSON.stringify(release.media.map((m) => [m.path, m.md5])))
       .update(
         JSON.stringify({
           ...metadata,
@@ -498,22 +836,48 @@ async function main(): Promise<void> {
           };
     credentials.pending = pending;
     await saveState(path, credentials);
+    const staged =
+      resuming &&
+      (pending.upload === "zip" ||
+        (pending.upload && Date.parse(pending.upload.expires_at) > Date.now()))
+        ? pending.upload
+        : undefined;
     try {
       const result = await api.update({
         ...input,
         ...metadata,
+        prepared: release,
+        knownMedia,
+        knownText,
         projectId: handle.project_id,
         agentToken: credentials.agent_token,
         expectedVersion: pending.expected_version,
         operationId: pending.operation_id,
+        ...(staged ? { upload: staged } : {}),
+        onUpload: async (upload) => {
+          pending.upload =
+            upload === "zip"
+              ? upload
+              : {
+                  upload_id: upload.upload_id,
+                  upload_token: upload.upload_token,
+                  expires_at: upload.expires_at,
+                };
+          await saveState(path, credentials);
+        },
       });
       handle.content_version = result.content_version;
       handle.play_url = result.play_url;
+      delete handle.pull_conflicts;
+      await remember(handle, release, directory);
       await saveState(statePath, handle);
       delete credentials.pending;
       await saveState(path, credentials);
       output(result);
     } catch (error) {
+      // A rejection, busy included, proves this operation was not applied, so a
+      // changed rerun may start afresh; a retry of an earlier uncertain attempt
+      // keeps its operation, because that attempt may have been applied.
       if (
         error instanceof RosebudError &&
         error.outcome !== "unknown" &&
@@ -603,7 +967,7 @@ async function account(
             ...loginView(current, saved),
             next_action:
               current.status === "active"
-                ? "Already logged in. To use another account, run rosebud logout, then rosebud login."
+                ? "Already logged in. To use another account, run `rosebud logout`, then `rosebud login`."
                 : "This login still waits for approval. Give the person its private approval_url.",
           });
           return;
@@ -626,7 +990,7 @@ async function account(
         approval_url: login.approval_url,
         expires_at: login.expires_at,
         next_action:
-          "Give the private approval_url to the person. After they sign in and approve, run rosebud whoami, then make assets.",
+          "Give the private approval_url to the person. After they sign in and approve, run `rosebud whoami`, then make assets.",
       });
       return;
     }
@@ -757,9 +1121,10 @@ async function assets(
       ...(maxCredits !== undefined ? { maxCredits: Number(maxCredits) } : {}),
     });
   } catch (error) {
-    if (unknownToken(error))
+    // An expired login keeps Rosebud's own message, which says what to do.
+    if (unknownToken(error) && (error as RosebudError).code !== "key_expired")
       throw new RosebudError(
-        "Rosebud did not accept the saved login. Run rosebud whoami: a pending login still needs the person to approve its approval_url, and after revoked or expired, run rosebud login again.",
+        `Rosebud did not accept the saved login. Run rosebud whoami: a pending login still needs the person to approve its approval_url, and after revoked or expired, run rosebud login again.${creating ? " Then rerun the identical create; it resumes the saved request without paying again." : ""}`,
         {
           kind: "api",
           code: (error as RosebudError).code,
@@ -954,11 +1319,15 @@ async function createAsset(
         });
       } catch (error) {
         // A rejection proves no job holds this key, unless a retry was refused
-        // (auth, throttling) before Rosebud looked the key up.
+        // (auth, throttling, busy) before Rosebud looked the key up.
         if (
           error instanceof RosebudError &&
           error.outcome !== "unknown" &&
-          !(resuming && [401, 403, 429].includes(error.status ?? 0))
+          !(
+            resuming &&
+            ([401, 403, 429].includes(error.status ?? 0) ||
+              error.code === "busy")
+          )
         )
           await removeState(path);
         throw error;
@@ -973,7 +1342,7 @@ async function createAsset(
       await removeState(path);
       output({
         ...job,
-        next_action: `Run rosebud assets status ${job.id} until it succeeds, then rosebud assets download <asset id> --out <file>.`,
+        next_action: `Run \`rosebud assets status ${job.id}\` until it succeeds, then \`rosebud assets download <asset id> --out <file>\`.`,
       });
       return;
     }
@@ -990,10 +1359,13 @@ async function createAsset(
       try {
         job = await api.assetJob({ token, jobId: job.id });
       } catch (error) {
-        // Reading a job is safe to repeat, so brief outages only delay the next poll.
+        // Reading a job is safe to repeat, so brief outages, throttling and a busy
+        // Rosebud only delay the next poll.
         if (
           !(error instanceof RosebudError) ||
-          (error.outcome !== "unknown" && error.status !== 429)
+          (error.outcome !== "unknown" &&
+            error.status !== 429 &&
+            error.code !== "busy")
         )
           throw error;
       }
@@ -1037,11 +1409,24 @@ async function createAsset(
   });
 }
 
-/** Server-validated diagnostics worth showing; never the raw response body. */
-function apiDetails(error: RosebudError): {
+interface ApiDetails {
   filename?: string;
   limit?: number;
-} {
+  changed_paths?: string[] | null;
+  required_scope?: string;
+}
+/** The scope Rosebud says a request needs, from either error shape. */
+function requiredScope(body: JsonValue | undefined): string | undefined {
+  if (!isObject(body)) return undefined;
+  const scope = isObject(body.error)
+    ? body.error.required_scope
+    : body.required_scope;
+  return typeof scope === "string" && /^[a-z]{1,32}:[a-z]{1,32}$/.test(scope)
+    ? scope
+    : undefined;
+}
+/** Server-validated diagnostics worth showing; never the raw response body. */
+function apiDetails(error: RosebudError): ApiDetails {
   const body = error.body;
   if (
     error.kind !== "api" ||
@@ -1050,19 +1435,121 @@ function apiDetails(error: RosebudError): {
     Array.isArray(body)
   )
     return {};
+  const scope = requiredScope(body);
   const details = body.error;
+  // Gateway errors (`{detail, code}`) have no `error` key, but can name a scope.
   if (!details || typeof details !== "object" || Array.isArray(details))
-    return {};
-  const { filename, limit } = details;
+    return scope ? { required_scope: scope } : {};
+  const { filename, limit, changed_paths: changed } = details;
+  const paths = pathList(changed);
+  const bytes = byteLimit(limit);
   return {
     ...(typeof filename === "string" && filename.length <= 512
       ? { filename }
       : {}),
-    ...(typeof limit === "number" && Number.isSafeInteger(limit)
-      ? { limit }
-      : {}),
+    ...(bytes !== undefined ? { limit: bytes } : {}),
+    ...(paths !== undefined ? { changed_paths: paths } : {}),
+    ...(scope ? { required_scope: scope } : {}),
   };
 }
+/** A limit as a number: servers before ENG-4832 sent it as a string of digits. */
+function byteLimit(value: JsonValue | undefined): number | undefined {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) ? value : undefined;
+  return typeof value === "string" && /^\d{1,15}$/.test(value)
+    ? Number(value)
+    : undefined;
+}
+/**
+ * The files an update conflict names: null when Rosebud can't tell, else a bounded
+ * list. Rosebud names each changed path once, from both versions' files, so the
+ * list is at most twice the per-game file limit.
+ */
+function pathList(value: JsonValue | undefined): string[] | null | undefined {
+  if (value === null) return null;
+  return Array.isArray(value) &&
+    value.length <= 2 * GAME_FILES &&
+    value.every((path) => typeof path === "string" && path.length <= 500)
+    ? (value as string[])
+    : undefined;
+}
+
+/**
+ * What to do about a refusal, in words an agent can act on. Commands sit in
+ * backticks so a sentence's period never sticks to them. Never about pricing.
+ */
+function nextAction(
+  error: RosebudError,
+  details: ApiDetails,
+): string | undefined {
+  const { command, directory, state } = invocation;
+  // Whether or not its request was kept, rerunning a create can't pay twice.
+  const rerunCreate =
+    command === "assets create"
+      ? ". After they approve, rerun the identical `rosebud assets create` command; it resumes the saved request without paying again."
+      : ".";
+  switch (error.code) {
+    case "busy": {
+      const seconds = error.retryAfterSeconds;
+      const wait = seconds
+        ? `in ${seconds} second${seconds === 1 ? "" : "s"}`
+        : "shortly";
+      return command === "publish"
+        ? `Rosebud is busy. Run the same command again ${wait}; no game was created, so publishing again is safe.`
+        : `Rosebud is busy. Run the same command again ${wait}; nothing was changed.`;
+    }
+    case "upload_retry":
+      return "Run the same command again; Rosebud is still checking this game's existing files.";
+    case "pending_operation":
+      return `Run \`rosebud status${state === undefined ? "" : ` --state ${shellArg(state)}`}\`, reconcile what changed in Rosebud into your files, then run your update again with \`--expected-version <content_version from status>\`. To retry the earlier update unchanged, rerun its identical command.`;
+    case "version_conflict": {
+      const changed = details.changed_paths;
+      const pull = `\`rosebud pull ${gameFlags(directory, state)}\``;
+      if (changed === null)
+        return `Rosebud can't tell which files changed. Run ${pull} and compare before updating.`;
+      if (changed && changed.length === 0)
+        return `Only the game's title, description or cover changed in Rosebud. Run \`rosebud status${state === undefined ? "" : ` --state ${shellArg(state)}`}\` and pass its content_version as \`--expected-version\`.`;
+      if (changed)
+        return `Rosebud changed ${changed.length} file(s) since your last sync: ${changed.slice(0, 10).map(quoted).join(", ")}${changed.length > 10 ? ", …" : ""}. Run ${pull} to bring them in, merge, then update again.`;
+      return undefined;
+    }
+    case "plan_required":
+      return "Publishing and updating still work. Reading files back needs the game owner's plan to include code download, so ask the person what they changed in Rosebud before you update, to avoid replacing their edits.";
+    case "release_upload_limit": {
+      const limit =
+        details.limit === undefined ? "" : ` (limit: ${details.limit} bytes)`;
+      return command === "publish"
+        ? `This publish adds more new media than Rosebud takes at once${limit}. Publish with part of the media first, then update with the rest; files Rosebud already has are not uploaded again.`
+        : `This update adds more new media than Rosebud takes at once${limit}. Update with part of the new media first, then again with the rest; files Rosebud already has are not uploaded again.`;
+    }
+    case "upload_stale":
+    case "upload_expired":
+    case "invalid_upload":
+      return "Run the same command again; it declares the media in a new upload session.";
+    case "sync_unavailable":
+      return "This Rosebud server can't read files back or take file-by-file uploads yet.";
+    case "key_expired":
+      return `This login expired after 90 days without use. Run \`rosebud login\` and give the new approval_url to the person${rerunCreate}`;
+    case "insufficient_scope":
+      return `This login wasn't granted ${details.required_scope === undefined ? "that permission" : quoted(details.required_scope)}. Run \`rosebud logout\`, then \`rosebud login\`, and give the new approval_url to the person${rerunCreate}`;
+    default:
+      return undefined;
+  }
+}
+
+// Agents stop commands that outlive their timeouts. Release the state locks so the
+// rerun isn't refused, and exit with the code a shell gives for the signal.
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+] as const)
+  process.on(signal, () => {
+    const released = releaseLocks() > 0 ? "; its state lock was released" : "";
+    process.stderr.write(
+      `${JSON.stringify({ error: { kind: "transport", code: "interrupted", message: `Stopped by ${signal} before finishing${released}. Run the same command again to finish, except publish: an interrupted publish may already have created the game, so don't publish again automatically.`, outcome: "unknown" } })}\n`,
+    );
+    process.exit(code);
+  });
 
 main().catch((error: unknown) => {
   const known =
@@ -1072,8 +1559,14 @@ main().catch((error: unknown) => {
           "Could not complete the command. Check local state before retrying; no automatic retry was attempted.",
           { kind: "response", code: "unexpected_error", outcome: "unknown" },
         );
+  const details = apiDetails(known);
+  const action =
+    refusalAdvice.next_action ??
+    (known.kind === "api" || known.code === "pending_operation"
+      ? nextAction(known, details)
+      : undefined);
   process.stderr.write(
-    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...apiDetails(known), ...errorContext } })}\n`,
+    `${JSON.stringify({ error: { kind: known.kind, code: known.code, message: known.message, outcome: known.outcome, ...(known.status !== undefined ? { status: known.status } : {}), ...(known.retryAfterSeconds !== undefined ? { retry_after_seconds: known.retryAfterSeconds } : {}), ...details, ...(action ? { next_action: action } : {}), ...errorContext } })}\n`,
   );
   process.exitCode =
     known.outcome === "unknown"
