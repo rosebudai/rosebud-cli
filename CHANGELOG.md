@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Log in once with `rosebud login`: the person approves a private link, with no API key to copy. `rosebud whoami` shows the login's status and the person's credit balance, and `rosebud logout` revokes it.
 - Make game assets with the person's Rosebud credits: `rosebud assets models`, `quote`, `create`, `status`, `list` and `download`. `create` refuses quotes above `--max-credits`, waits for the job, saves the file with `--out`, and resumes the same job when you rerun an interrupted command.

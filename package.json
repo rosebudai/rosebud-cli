@@ -1,6 +1,6 @@
 {
   "name": "@rosebudai/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Publish and update browser-ready games from your terminal or coding agent.",
   "keywords": [
     "rosebud",
