@@ -167,13 +167,13 @@ Choose a model, check the price, then make the asset:
 
 ```sh
 rosebud assets models --category image
-rosebud assets quote --model flux-2-flash --prompt 'Mossy stone tile, top-down' \
+rosebud assets quote --model rosebud-image --prompt 'Mossy stone tile, top-down' \
   --input asset_type=sprite
-rosebud assets create --model flux-2-flash --prompt 'Mossy stone tile, top-down' \
-  --input asset_type=sprite --max-credits 300 --out ./dist/assets/stone-tile.png
+rosebud assets create --model rosebud-image --prompt 'Mossy stone tile, top-down' \
+  --input asset_type=sprite --max-credits 500 --out ./dist/assets/stone-tile.png
 ```
 
-`assets models` lists each model's inputs, price and license; `--category` narrows the list (for example `image`, `skybox`, `model_3d`, `sound_effect` or `music`). `--prompt` fills the model's `prompt` input, `--input name=value` sets any other input it lists (repeat it for several), and `--input-json ./input.json` supplies inputs as one JSON object. Quotes are free and check the inputs. For an image that sits on top of a scene (a character, pickup or icon), pass `--input asset_type=sprite` as above: the default image type keeps a solid background.
+`assets models` lists each model's inputs, price and license; `--category` narrows the list (for example `image`, `skybox`, `model_3d`, `sound_effect` or `music`). `--prompt` fills the model's `prompt` input, `--input name=value` sets any other input it lists (repeat it for several), and `--input-json ./input.json` supplies inputs as one JSON object. Quotes are free and check the inputs. For an image that sits on top of a scene (a character, pickup or icon), pass `--input asset_type=sprite` as above when the model lists `asset_type` (`rosebud-image` does): its default type keeps a solid background. Other image models list their own background input.
 
 `create` quotes, refuses a quote above `--max-credits`, starts the job, waits for it (up to `--timeout-ms`, default 600000) and saves the file to `--out`. It never replaces an existing file unless you pass `--force`. With `--no-wait` it returns the job at once; check it with `rosebud assets status <job_id>` and save the file with `rosebud assets download <asset_id> --out <path>`. `rosebud assets list` searches the person's existing assets with `--query` and `--category`.
 
