@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `--help` says to pass `--input asset_type=sprite` for an image that sits on top of a scene, on models that list `asset_type`; their default type keeps a solid background. The README's asset example uses `rosebud-image`.
+
 ## 0.2.0
 
 - Log in once with `rosebud login`: the person approves a private link, with no API key to copy. `rosebud whoami` shows the login's status and the person's credit balance, and `rosebud logout` revokes it.
