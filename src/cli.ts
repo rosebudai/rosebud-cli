@@ -104,6 +104,8 @@ login returns a PRIVATE approval link; the human must approve before assets work
 A login expires after 90 days without use; whoami shows its scopes and expires_at.
 --prompt fills the model's prompt input; --input sets any other input it lists
 (repeatable), and --input-json <file> supplies inputs as one JSON object.
+For an image that sits on top of a scene (a character, pickup or icon), pass
+--input asset_type=sprite: the default image type keeps a solid background.
 create quotes first, refuses a quote above --max-credits, then waits up to
 --timeout-ms (default 600000) and saves the file to --out. --force replaces an
 existing file; --no-wait returns the job at once. After an uncertain create, rerun

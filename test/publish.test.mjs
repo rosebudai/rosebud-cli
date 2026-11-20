@@ -459,6 +459,7 @@ test("CLI help/version do not require input or API access", async () => {
   assert.equal(help.code, 0);
   assert.equal(help.stderr, "");
   assert.match(help.stdout, /--directory/);
+  assert.match(help.stdout, /--input asset_type=sprite/);
   const version = await cli(["--version"]);
   assert.equal(version.code, 0);
   const metadata = JSON.parse(
